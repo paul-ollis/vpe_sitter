@@ -31,6 +31,7 @@ TO_END_OF_LINE = 0x7fff_ffff
 #: The integers define a (Python) character range and the string is the name of
 #: the syntax item assigned by Tree-sitter.
 InlineSyntaxItem: TypeAlias = tuple[int, int, str]
+SyntaxItem: TypeAlias = tuple[int, int, int, int, str]
 
 log = functools.partial(vpe.call_soon, print)
 
@@ -192,12 +193,15 @@ class InprogressParseOperation:
                 self.affected_lines.append(
                     (rng.start_point.row, rng.end_point.row))
             self.tree = tree
+            self.dump()
+            self._walk_tree_1()
+            self._walk_tree_2()
             self.active = False
             if self.timer:
                 self.timer = None
-            print(f'New tree: {tree.root_node=}')
-            print(f'          {tree.included_ranges=}')
-            print(f'          {self.affected_lines=}')
+            #- print(f'New tree: {tree.root_node=}')
+            #- print(f'          {tree.included_ranges=}')
+            #- print(f'          {self.affected_lines=}')
             self.parse_done_callback(self.affected_lines)
 
             if self.pending_changes:
@@ -206,6 +210,91 @@ class InprogressParseOperation:
     def _schedule_reparse(self) -> None:
         ms_delay = 10
         self.timer = vpe.Timer(ms_delay, self._try_parse)
+
+    def _walk_tree_1(self) -> None:
+        """Walk the tree using simple recursion."""
+
+        start = time.time()
+        if self.tree is None:
+            return
+
+        def process(node, field_name=''):
+            for i, child in enumerate(node.children):
+                field_name = node.field_name_for_child(i)
+                process(child, field_name)
+
+        process(self.tree.root_node)
+        print(f'Walk-1 in {time.time() - start:.4f}s')
+
+    def _walk_tree_2(self) -> None:
+        """Walk the tree using simple recursion."""
+
+        start = time.time()
+        if self.tree is None:
+            return
+
+        def process(node, field_name=''):
+            if not cursor.goto_first_child():
+                return
+            i = 0
+            while True:
+                field_name = node.field_name_for_child(i)
+                process(cursor.node, field_name)
+                if not cursor.goto_next_sibling():
+                    cursor.goto_parent()
+                    return
+                i += 1
+
+        cursor = self.tree.walk()
+        process(cursor.node)
+        print(f'Walk-2 in {time.time() - start:.4f}s')
+
+    def dump(self):
+        """Dump a printout of the tree."""
+        if self.tree is None:
+            return
+
+        # I am not sure what the grammar name represents, nor how it can be
+        # used. So I tend to ignore it.
+        show_grammar_name = False
+        lines_left = 50
+
+        def put_node(node, field_name=''):
+            nonlocal lines_left
+
+            if lines_left <= 0:
+                if lines_left == 0:
+                    s.append(f'{pad[-1]}...')
+                lines_left -= 1
+                return
+
+            a = tuple(node.start_point)
+            b = tuple(node.end_point)
+            type_name = node.type
+
+            if show_grammar_name:
+                grammar_name = node.grammar_name
+                if grammar_name and grammar_name != type_name:
+                    name = f'{grammar_name}:{type_name}'
+                else:
+                    name = type_name
+            name = type_name
+
+            if field_name:
+                name = f'{field_name}:{name}'
+            s.append(f'{pad[-1]}{name} {a}->{b}')
+            lines_left -= 1
+
+            pad.append(pad[-1] + '  ')
+            for i, child in enumerate(node.children):
+                field_name = node.field_name_for_child(i)
+                put_node(child, field_name)
+            pad.pop()
+
+        s = []
+        pad = ['']
+        put_node(self.tree.root_node)
+        print('\n'.join(s))
 
 
 class Listener:
@@ -282,7 +371,7 @@ class Listener:
         :added:      The number of lines added or, if negative, deleted.
         :ops:        A list of the operations applied within the line range.
         """
-        log(f'Change: {start_lidx=} {end_lidx=} {added=}')
+        #- log(f'Change: {start_lidx=} {end_lidx=} {added=}')
         # TODO: Protect against IndexError.
 
         # The start and old end byte offsets depend on the previously
@@ -372,6 +461,7 @@ class SyntaxLineSpans:
         """The number of lines in the map."""
         return len(self._lines)
 
+    # TODO: Not needed?
     def copy(self) -> SyntaxLineSpans:
         """Create a copy of this highlight map."""
         # pylint: disable=protected-access
@@ -427,6 +517,57 @@ class SyntaxLineSpans:
         :start_index:
             The start of the block of lines for which to build the map.
         """
+        start_time = time.time()
+        start_point = (start_index, 0)
+        end_index = min(self.line_count, start_index + self.BLOCK_SIZE)
+        end_point = (end_index, 0)
+        self._query.set_point_range((start_point, end_point))
+        captures = self._query.captures(self._tree.root_node)
+
+        # Discussion:
+        #   We should not sort based on column ranges. Instead there should be
+        #   a defined layering for syntax highlighting, which I this the
+        #   vpe_syntax code can get simply by using property priorities.
+        #
+        #   If we work in chunks of lines (50 still seems good). We can
+        #   possibly use multi-line properties.
+        max_line_index = len(self._lines) - 1
+        for highlight_name, nodes in captures.items():
+            for node in nodes:
+                node_start_row, node_start_column = node.start_point
+                if node_start_row > max_line_index:
+                    continue
+                node_end_row, node_end_column = node.end_point
+
+                # Tree-sitter uses byte offsets, but we want to use characters
+                # so we adjust each highlight's offset here to match character
+                # (codepoint) positions.
+                text = self._lines[node_start_row]
+                mapper = build_byte_to_codeppoint_table(text)
+                node_start_column = mapper[node_start_column]
+
+                text = self._lines[node_end_row]
+                mapper = build_byte_to_codeppoint_table(text)
+                node_end_column = mapper[node_end_column]
+
+                syntax_item = (
+                    node_start_row, node_start_column,
+                    node_end_row, node_end_column,
+                    highlight_name,
+                )
+                self._highlights[node_start_row].append(syntax_item)
+        self.times.append(time.time() - start_time)
+
+    def old_build_part_of_highlight_map(self, start_index: int) -> None:
+        """Build part of the highlight map.
+
+        This is invoked by __getitem__, when an uncached highlight list is
+        accessed. It generates the highlights for the block of lines containing
+        the index and adds them to the cache.
+
+        :start_index:
+            The start of the block of lines for which to build the map.
+        """
         # pylint: disable=too-many-locals
         start_time = time.time()
         start_point = (start_index, 0)
@@ -435,6 +576,13 @@ class SyntaxLineSpans:
         self._query.set_point_range((start_point, end_point))
         captures = self._query.captures(self._tree.root_node)
 
+        # Discussion:
+        #   We should not sort based on column ranges. Instead there should be
+        #   a defined layering for syntax highlighting, which I this the
+        #   vpe_syntax code can get simply by using property priorities.
+        #
+        #   If we work in chunks of lines (50 still seems good). We can
+        #   possibly use multi-line properties.
         line_count = len(self._lines)
         for highlight_name, nodes in captures.items():
             for node in nodes:
@@ -482,12 +630,13 @@ class SyntaxLineSpans:
                 for highlight in self._highlights[index]
             ]
 
-        # The highlights for each line are sorted by start index and then end
-        # index. This is sensible order for applying syntax highlighting.
-        for line_index in range(start_index, end_index):
-            if line_index not in self._highlights:
-                continue
-            self._highlights[line_index].sort(key=lambda h: h[:2])
+        if False:
+            # The highlights for each line are sorted by start index and then end
+            # index. This is sensible order for applying syntax highlighting.
+            for line_index in range(start_index, end_index):
+                if line_index not in self._highlights:
+                    continue
+                self._highlights[line_index].sort(key=lambda h: h[:2])
 
         # Remove any highlights that are totally obscured by later highlights.
         for line_index in range(start_index, end_index):

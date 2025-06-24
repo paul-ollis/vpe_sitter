@@ -7,7 +7,24 @@
 (identifier) @variable
 
 ; Reset highlighting in f-string interpolations
-(interpolation) @none
+; TODO: Why?
+; (interpolation) @none
+(interpolation) @interpolation
+
+; PAO: Specifically identify docstrings.
+;      TODO: I would like to only accept double quote characters.
+(module
+  (expression_statement
+    (string) @docstring
+  )
+)
+(function_definition
+  (block
+    (expression_statement
+      (string) @docstring
+    )
+  )
+)
 
 ;; Identifier naming conventions
 ((identifier) @type
@@ -47,6 +64,14 @@
   right: (call
     function: (identifier) @_func))
  (#any-of? @_func "TypeVar" "NewType"))
+
+(format_specifier) @format.specifier
+
+(format_specifier
+  (format_expression
+    (identifier) @format.identifier
+  )
+)
 
 ; Function calls
 

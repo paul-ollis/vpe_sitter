@@ -87,14 +87,15 @@ _CUR_PROP = """
 function! Cur_prop()
     let props = prop_list(line('.'))
     let col = col('.')
+    let found = []
     for prop in props
         let pcol = prop['col']
         let plen = prop['length']
         if pcol <= col && (pcol + plen) > col
-            return get(prop, 'type', '-')
+            call add(found, get(prop, 'type', '-'))
         endif
     endfor
-    return ''
+    return found
 endfunction
 """
 
