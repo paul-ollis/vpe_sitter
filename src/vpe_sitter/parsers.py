@@ -50,6 +50,7 @@ def provide_parser(filetype: str) -> Parser | None:
     return Parser(_filetype_to_language[filetype])
 
 
+# TODO: This should be dead.
 def provide_query_for_language(filetype: str) -> Query | None:
     """Parse the S-expressions into a Query for the given language.
 

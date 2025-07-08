@@ -10,40 +10,42 @@ from vpe import vim
 from vpe_sitter import listen, parsers
 
 
-def treesit_current_buffer() -> bool:
+def treesit_current_buffer() -> str:
     """Start running Tree-sitter on the current buffer.
 
-    Tree-sitter information (`Struct`) is attached to the buffer's store. A
+    A `Listener` instance is attached to the buffer's store. The `Listener`
+    listens for changes to the buffer's contents and (re)parses the code
+    as a result. The parsing executes as a pseudo-background task so that Vim
+    remains responsive.
 
     :return:
-        ``True`` if Tree-sitter parsing was succesfully set up for the buffer.
+        An error message id parsing is not possible. An empty string if
+        successful.
     """
     buf = vim.current.buffer
     if vim.options.encoding != 'utf-8':
         # Currently, I think, UTF-8 encoded text is required.
-        print(f'Cannot run Tree-sitter on {buf.options.encoding} text.')
-        return False
+        return f'Cannot run Tree-sitter on {buf.options.encoding} text.'
 
-    parser = parsers.provide_parser(buf.options.filetype)
+    filetype = buf.options.filetype
+    parser = parsers.provide_parser(filetype)
     if parser is None:
         # No Tree-sitter support available.
-        return False
+        return f'No Tree-sitter parser available for {filetype}.'
 
-    print(f'Can parse {buf.options.filetype}')
+    print(f'Can parse {filetype}')
     print(f'   {parser=}')
     print(f'   {parser.language=}')
 
-    query = parsers.provide_query_for_language(buf.options.filetype)
-    print(f'   {query=}')
     store = buf.store('tree-sitter')
-    store.listener = listen.Listener(buf, parser, query)
+    store.listener = listen.Listener(buf, parser)
 
     st = '%1*%<%5*%n: %f %1* %2*%m%1*%R%=%4*%15'
     st += '{Cur_prop()}'
     st += '%1* %3*%y%1* W=%{winwidth(0)} %8(%lx%c%) %P'
     vim.current.window.options.statusline = st
 
-    return True
+    return ''
 
 
 class Plugin(vpe.CommandHandler):
@@ -58,6 +60,7 @@ class Plugin(vpe.CommandHandler):
         """Execute the Treesit command."""
         treesit_current_buffer()
 
+    # TODO: A non-command.
     @vpe.CommandHandler.command('Ashow', pass_info=True, range=True)
     def ashow(self, info: vpe.CommandInfo):
         """Execute the Ashow command."""
@@ -71,6 +74,7 @@ class Plugin(vpe.CommandHandler):
             highlighter.log_range = None
             highlighter.dry_run = False
 
+    # TODO: A non-command.
     @vpe.CommandHandler.command('Ainfo', pass_info=True)
     def ainfo(self, _info: vpe.CommandInfo):
         """Execute the Ainfo command."""
