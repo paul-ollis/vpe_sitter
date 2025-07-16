@@ -3,11 +3,19 @@
 This plugin maintains a Tree-sitter parse tree for each buffer that
 has a supported language.
 """
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import vpe
-from vpe import vim
+from vpe import core, vim
+from vpe.argparse import (
+    CommandBase, SubCommandBase, TopLevelSubCommandHandler, command_handler)
 
 from vpe_sitter import listen, parsers
+
+if TYPE_CHECKING:
+    from argparse import Namespace
 
 
 def treesit_current_buffer() -> str:
@@ -48,16 +56,87 @@ def treesit_current_buffer() -> str:
     return ''
 
 
-class Plugin(vpe.CommandHandler):
-    """The plug-in."""
+class TreeCommand(CommandBase):
+    """The 'debug tree' sub-command support."""
 
-    def __init__(self):
-        # create_text_prop_types()
+    def add_arguments(self) -> None:
+        """Add the arguments for this command."""
+        self.arg_parser.add_argument(
+            'start_line', type=int, help='First line of tree dump range.')
+        self.arg_parser.add_argument(
+            'end_line', type=int, help='Last line of tree dump range.')
+
+    def handle_command(self, args: Namespace):
+        """Handle the 'Treesit debug tree' command."""
+        debug = listen.debug_settings
+        debug.tree_line_start = args.start_line
+        debug.tree_line_end = args.end_line
+
+
+class RangesCommand(CommandBase):
+    """The 'debug ranges' sub-command support."""
+
+    def add_arguments(self) -> None:
+        """Add the arguments for this command."""
+        self.arg_parser.add_argument(
+            'flag', choices=['on', 'off'],
+            help='Enable (on) or disable (off) tree change ranges logging.')
+
+    def handle_command(self, args: Namespace):
+        """Handle the 'Treesit debug ranges' command."""
+        debug = listen.debug_settings
+        debug.log_changed_ranges = args.flag == 'on'
+
+
+class BufchangesCommand(CommandBase):
+    """The 'debug bufchanges' sub-command support."""
+
+    def add_arguments(self) -> None:
+        """Add the arguments for this command."""
+        self.arg_parser.add_argument(
+            'flag', choices=['on', 'off'],
+            help='Enable (on) or disable (off) buffer changes logging.')
+
+    def handle_command(self, args: Namespace):
+        """Handle the 'Treesit deug bufchanges' command."""
+        debug = listen.debug_settings
+        debug.log_buffer_changes = args.flag == 'on'
+
+
+class DebugSubcommand(SubCommandBase):
+    """The 'debug' sub-command support."""
+
+    sub_commands = {
+        'tree': (TreeCommand, 'Control tree dumping.'),
+        'ranges': (RangesCommand, 'Turn changed ranges logging on/off.'),
+        'bufchanges': (
+            BufchangesCommand, 'Turn buffer change logging on/off.'),
+    }
+
+
+class Plugin(TopLevelSubCommandHandler, core.CommandHandler):
+    """The plug-in, which provides the commands."""
+
+    sub_commands = {
+        'on': (':simple', 'Turn on tree sitting for the current buffer.'),
+        'debug': (DebugSubcommand, 'Control debugging logging.'),
+    }
+
+    def __init__(self, command_name: str):
+        super().__init__(command_name=command_name)
         self.auto_define_commands()
+        self._init_completion()
 
-    @vpe.CommandHandler.command('Treesit')
-    def run(self):
-        """Execute the Treesit command."""
+    @command_handler('Treesit', bar=True)
+    def handle_sub_command(self, *cmd_args):
+        """Parse and execute a Treesit command."""
+        sub_cmd, args = self.sub_command_parser.parse_args(cmd_args)
+        if sub_cmd == '':
+            return
+        super().handle_sub_command(sub_cmd, args)
+
+    def handle_on(self) -> None:
+        """Handle the 'Treesit on' command."""
         treesit_current_buffer()
 
     # TODO: A non-command.
@@ -84,8 +163,7 @@ class Plugin(vpe.CommandHandler):
         highlighter.identify_line(lnum - 1)
 
 
-app = Plugin()
-
+app = Plugin('Treesit')
 
 _CUR_PROP = """
 function! Cur_prop()
