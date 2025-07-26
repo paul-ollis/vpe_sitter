@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 
-from tree_sitter import Language, Parser, Query
+from tree_sitter import Language, Parser
 
 _filetype_to_parser_module_name: dict[str, str] = {
     'python': 'tree_sitter_python',
+    'c': 'tree_sitter_c',
 }
 _filetype_to_language: dict[str, Language] = {}
 
@@ -47,24 +47,8 @@ def provide_parser(filetype: str) -> Parser | None:
 
         print(f'Tree-sitter support for {filetype=} is available')
 
-    return Parser(_filetype_to_language[filetype])
-
-
-# TODO: This should be dead.
-def provide_query_for_language(filetype: str) -> Query | None:
-    """Parse the S-expressions into a Query for the given language.
-
-    The call **must** only invoke this after `provide_parser` has worked for
-    the same filetype.
-    """
-    mod_path = Path(__file__)
-    scmdir_path = mod_path.parent / 'resources/tree_sitter_queries'
-    s_file_path = scmdir_path / f'{filetype}.scm'
-    if not s_file_path.exists():
-        print(f'Tree-sitter S-expr (scm) file not found for {filetype=}')
-        print(f'...Looked for in {scmdir_path}')
-        return None
-
     language = _filetype_to_language[filetype]
-    return language.query(
-        s_file_path.read_text(encoding='utf-8', errors='ignore'))
+    if language is None:
+        return None
+    else:
+        return Parser(language)

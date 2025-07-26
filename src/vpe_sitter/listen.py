@@ -7,15 +7,16 @@ from __future__ import annotations
 
 import functools
 import time
-from enum import Enum
 from dataclasses import dataclass, field
+from enum import Enum
 from itertools import accumulate
-from typing import Callable, NamedTuple, TypeAlias
+from typing import Callable, Final, NamedTuple, TypeAlias
 from weakref import proxy
 
 from tree_sitter import Parser, Tree
 
 import vpe
+from vpe import EventHandler, vim
 from vpe.vpe_lib import diffs
 
 #: A list of line ranges that need updating for the latest (re)parsing.
@@ -26,7 +27,7 @@ ParseCompleteCallback: TypeAlias = Callable[
     ['ConditionCode', AffectedLines], None]
 
 #: How long the parse tree may be 'unclean' before clients are notified.
-MAX_UNCLEAN_TIME = 0.5
+MAX_UNCLEAN_TIME = 0.2
 
 #: A print-equivalent function that works inside Vim callbacks.
 log = functools.partial(vpe.call_soon, print)
@@ -36,10 +37,17 @@ log = functools.partial(vpe.call_soon, print)
 class DebugSettings:
     """Setting controlling debug output."""
 
-    tree_line_start: int = 10
-    tree_line_end: int = 20
+    tree_line_start: int = -1
+    tree_line_end: int = -1
     log_buffer_changes: bool = False
     log_changed_ranges: bool = False
+    log_performance: bool = False
+
+    @property
+    def dump_tree(self) -> bool:
+        """Flag indicating that the (partial) tree should be logded."""
+        return self.tree_line_end > 0 and (
+            self.tree_line_end >= self.tree_line_start)
 
 
 class ConditionCode(Enum):
@@ -101,24 +109,24 @@ class SyntaxTreeEdit(NamedTuple):
         return f'Bytes: {bb} / Lines: {frm} => {old_to}->{new_to}'
 
 
-@dataclass
-class BackgroundFullParser:
-    """A performer of a totally clean, background parse operation.
+class VimEventHandler(EventHandler):
+    """A global event handler for critical Vim events."""
+    def __init__(self):
+        self.auto_define_event_handlers('VPE_ListenEventGroup')
 
-    I have seen evidence of the Tree-sittter tree and the Vim buffer
-    occasionally becoming out of sync. My guess is that one of the following
-    is occurring:
+    @EventHandler.handle('BufReadPost')
+    def handle_buffer_content_loaded(self) -> None:
+        """React to a buffer's contents being reloaded.
 
-    - Vim is not generating correct buffer change notifications.
-    - The vpe_sitter code is failing to react to all such notifications or
-      is not correctly applying then to the Tree-sitter tree.
-    - The tree-sitter tree is not correctly applying edits.
-
-    This class arranges for a new tree to occasionally be created.
-
-    Except, we do not really need this. Just an occasional new tree without
-    edits.
-    """
+        Any listener for the buffer needs to be informed so that it can start
+        over with a clean parse tree.
+        """
+        buf = vim.current.buffer
+        store = buf.retrieve_store('syntax-sitter')
+        if store is not None:
+            listener = store.listener
+            if listener is not None:
+                listener.handle_bufer_reload()
 
 
 @dataclass
@@ -155,6 +163,7 @@ class InprogressParseOperation:
     tree: Tree | None = None
     timer: vpe.Timer | None = None
     changed_ranges: list = field(default_factory=list)
+    pending_changed_ranges: list = field(default_factory=list)
 
     parse_timeouts: int = 0
     parse_time: ActionTimer | None = None
@@ -171,9 +180,18 @@ class InprogressParseOperation:
             return
 
         if self.pending_changes:
+            self.pending_changed_ranges[:] = []
             if self.tree is not None:
                 for edit in self.pending_changes:
                     self.tree.edit(**edit._asdict())
+                    self.pending_changed_ranges.append(
+                        range(
+                            edit.start_point.row_index,
+                            edit.new_end_point.row_index)
+                    )
+                if debug_settings.log_changed_ranges:
+                    print(f'PAUL: {self.pending_changed_ranges}')
+
             self.pending_changes[:] = []
 
         self.parser.timeout_micros = 5_000
@@ -193,6 +211,20 @@ class InprogressParseOperation:
         if not self.active:
             self.parse_done_callback(ConditionCode.PENDING_CHANGES, [])
         vpe.call_soon_once(id(self), self.start)
+
+    def start_clean(self) -> None:
+        """Start a completely clean tree build.
+
+        Any in-progress build is abandoned, pending changes are discarded and
+        a new tree construction is started.
+        """
+        if self.timer:
+            self.timer.stop()
+            self.timer = None
+        self.pending_changes[:] = []
+        self.parse_time = None
+        self.tree = None
+        self.start()
 
     def _try_parse(self, _timer: vpe.Timer | None = None) -> None:
         try:
@@ -223,6 +255,8 @@ class InprogressParseOperation:
                     range(r.start_point.row, r.end_point.row + 1)
                     for r in self.tree.changed_ranges(tree)
                 ]
+                ranges = merge_ranges(ranges, self.pending_changed_ranges)
+                self.pending_changed_ranges[:] = []
                 if debug_settings.log_changed_ranges:
                     s = [f'Tree-siter reports {len(ranges)} changes:']
                     for r in ranges:
@@ -234,12 +268,14 @@ class InprogressParseOperation:
 
         if not self.pending_changes:
             # Parsing has completed without any intervening buffer changes.
-            #-print(
-            #-    f'Parse completed cleanly in {parse_time:.4f}s')
+            if debug_settings.log_performance:
+                print(
+                    f'Tree-sitter parsed cleanly in {parse_time:.4f}s')
             self.last_clean_time.restart()
             changed_ranges = build_changed_ranges()
             self.tree = tree
-            self.dump()
+            if debug_settings.dump_tree:
+                self.dump()
             self.parse_done_callback(
                 ConditionCode.NEW_CLEAN_TREE, changed_ranges)
 
@@ -247,21 +283,24 @@ class InprogressParseOperation:
             # The new tree is not clean. If not too much time has elapsed,
             # parse again to catch up.
             if self.last_clean_time.elapsed + parse_time < MAX_UNCLEAN_TIME:
-                #-print(
-                #-    f'Parse completed uncleanly in {parse_time:.4f}s,'
-                #-    ' trying to catch up.'
-                #-)
+                if debug_settings.log_performance:
+                    print(
+                        f'Tree-sitter parsed uncleanly in {parse_time:.4f}s,'
+                        ' trying to catch up.'
+                    )
                 vpe.call_soon_once(id(self), self.start)
             else:
                 # Inform clients that the tree has changed but is not up to
                 # date.
-                #-print(
-                #-    f'Parse completed uncleanly in {parse_time:.4f}s,'
-                #-    ' too slow to try catching up.'
-                #-)
+                if debug_settings.log_performance:
+                    print(
+                        f'Tree-sitter parse uncleanly in {parse_time:.4f}s,'
+                        ' too slow to try catching up.'
+                    )
                 changed_ranges = build_changed_ranges()
                 self.tree = tree
-                self.dump()
+                if debug_settings.dump_tree:
+                    self.dump()
                 self.parse_done_callback(
                     ConditionCode.NEW_OUT_OF_DATE_TREE, changed_ranges)
 
@@ -272,13 +311,20 @@ class InprogressParseOperation:
         ms_delay = 10
         self.timer = vpe.Timer(ms_delay, self._try_parse)
 
-    def dump(self):
-        """Dump a printout of the tree."""
+    def dump(
+            self, tree_line_start: int | None = None,
+            tree_line_end: int | None = None,
+        ):
+        """Dump a representaion of part of the tree."""
         if self.tree is None:
             return
 
-        start_lidx = debug_settings.tree_line_start - 1
-        end_lidx = debug_settings.tree_line_end
+        if tree_line_start is not None:
+            start_lidx = tree_line_start - 1
+            end_lidx = tree_line_end
+        else:
+            start_lidx = debug_settings.tree_line_start - 1
+            end_lidx = debug_settings.tree_line_end
         if start_lidx >= end_lidx:
             return
 
@@ -290,8 +336,10 @@ class InprogressParseOperation:
 
             a = tuple(node.start_point)
             b = tuple(node.end_point)
+            a_lidx = a[0]
+            b_lidx = b[0] + 1
 
-            no_overlap = start_lidx >= b[0] or end_lidx <= a[0]
+            no_overlap = start_lidx >= b_lidx or end_lidx <= a_lidx
             if not no_overlap:
                 type_name = node.type
                 if show_grammar_name:
@@ -315,7 +363,8 @@ class InprogressParseOperation:
         s = []
         pad = ['']
         put_node(self.tree.root_node)
-        print('\n'.join(s))
+        if s:
+            print('\n'.join(s))
 
 
 class Listener:
@@ -338,20 +387,23 @@ class Listener:
     # pylint: disable=too-many-instance-attributes
     listen_handle: vpe.BufListener
     in_progress_parse_operation: InprogressParseOperation
+    vim_event_handler: Final = VimEventHandler()
 
     def __init__(self, buf: vpe.Buffer, parser: Parser):
         self.buf = buf
+        self.reload_count = 0
         self.parser: Parser = parser
         self.tree_change_callbacks: list[ParseCompleteCallback] = []
         self.in_progress_parse_operation = InprogressParseOperation(
             proxy(self), self.parser, self.handle_parse_complete)
 
-        # The use of Vim's line2byte function seems like a good way to get the
-        # byte offsets of the lines, but this way is about 10 times faster.
+        # On my computer, this code is over 10 times faster than using Vim's
+        # line2byte function.
         self.byte_offsets = list(accumulate([
             len(line.encode('utf-8')) + 1 for line in self.buf], initial=0))
 
-        self.listen_handle = buf.add_listener(self.handle_changes)
+        self.listen_handle = buf.add_listener(
+            self.handle_changes, raw_changes=False)
         self.in_progress_parse_operation.start()
 
     @property
@@ -376,21 +428,28 @@ class Listener:
             end_lidx: int,
             added:int,
             ops: list[diffs.Operation],
+            vim_changes: list[dict] | None = None,
         ) -> None:
         """Process changes for the associated buffer.
 
         This is invoked by Vim to report changes to the buffer. The start
-        and end line indices are converted into `SyntaxTreeEdit` operation.
-        One is added to the `end_lidx` before the `SyntaxTreeEdit` is created.
-        This adjustment appear to be necessary to keep the Tree-sitter tree
-        properly synchronised.
+        and end line indices are converted into `SyntaxTreeEdit` operations.
 
-        :_buf:       The affected buffer, ignored because the buffer is known.
-        :start_lidx: Start of affected line range.
-        :end_lidx:   End of affected line range.
-        :added:      The number of lines added or, if negative, deleted.
-        :ops:        A list of the operations applied within the line range.
+        :_buf:        The affected buffer, ignored because the buffer is known.
+        :start_lidx:  Start of affected line range.
+        :end_lidx:    End of affected line range.
+        :added:       The number of lines added or, if negative, deleted.
+        :ops:         A list of the operations applied within the line range.
+        :vim_changes: The original Vim generated list of changes or None.
         """
+        # pylint: disable=too-many-arguments
+        # pylint: disable=too-many-locals,too-many-positional-arguments
+        # Special handling is required if Vim reports added lines starting
+        # past the end of the buffer. This happens when, for example, when
+        # executing normal('o') while on the last line.
+        if start_lidx == len(self.byte_offsets) - 1:
+            start_lidx = max(0, start_lidx - 1)
+
         # The start offset and old end byte offset depend on the previously
         # calculated line byte offsets.
         start_byte = self.byte_offsets[start_lidx]
@@ -420,9 +479,20 @@ class Listener:
             start_point, old_end_point, new_end_point,
         )
         if debug_settings.log_buffer_changes:
-            log(f'Handlechange: {start_lidx+1} {end_lidx+1} {added}')
-            log(f'              edit={edit.format_1()}')
+            s = []
+            s.append('Handlechange:')
+            s.append(f'   Lines: {start_lidx+1} {end_lidx+1} {added}')
+            s.append(f'   Edit:  {edit.format_1()}')
+            if vim_changes is not None:
+                for op in vim_changes:
+                    s.append(f'    {op}')
+            log('\n'.join(s))
+
         self.in_progress_parse_operation.add_edit(edit)
+
+    def handle_bufer_reload(self) -> None:
+        """React to this buffer's contents being reloaded."""
+        self.in_progress_parse_operation.start_clean()
 
     def add_parse_complete_callback(
             self, callback: ParseCompleteCallback,
@@ -433,6 +503,42 @@ class Listener:
         tree = self.in_progress_parse_operation.tree
         if tree is not None and not active:
             callback(ConditionCode.NEW_OUT_OF_DATE_TREE, [])
+
+    def print_tree(self, tree_line_start: int, tree_line_end: int):
+        """Print part of the syntax tree for this buffer."""
+        self.in_progress_parse_operation.dump(tree_line_start, tree_line_end)
+
+
+def merge_ranges(ranges_a: list[range], ranges_b: list[range]) -> list[range]:
+    """Merge two lists of ranges, combining any averlapping ranges."""
+    ranges = sorted(ranges_a + ranges_b, key=lambda r: (r.start, r.stop))
+    if len(ranges) < 2:
+        return ranges
+
+    combined = []
+    a = ranges.pop(0)
+    b = ranges.pop(0)
+    while True:
+        overlap = not (a.stop < b.start or b.stop < a.start)
+        if overlap:
+            nr = range(min(a.start, b.start), max(a.stop, b.stop))
+            combined.append(nr)
+            a = b = None
+        else:
+            combined.append(a)
+            a = b
+            b = None
+
+        if a is None:
+            if ranges:
+                a = ranges.pop(0)
+        if ranges:
+            b = ranges.pop(0)
+        if a is None:
+            return combined
+        if b is None:
+            combined.append(a)
+            return combined
 
 
 #: The debug settings object.

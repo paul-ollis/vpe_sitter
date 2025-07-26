@@ -5,17 +5,21 @@ has a supported language.
 """
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 import vpe
 from vpe import core, vim
 from vpe.argparse import (
-    CommandBase, SubCommandBase, TopLevelSubCommandHandler, command_handler)
+    CommandBase, SubCommandBase, TopLevelSubCommandHandler)
 
 from vpe_sitter import listen, parsers
 
 if TYPE_CHECKING:
     from argparse import Namespace
+
+# Function to print informational messages.
+echo_msg = partial(core.echo_msg, soon=True)
 
 
 def treesit_current_buffer() -> str:
@@ -41,17 +45,13 @@ def treesit_current_buffer() -> str:
         # No Tree-sitter support available.
         return f'No Tree-sitter parser available for {filetype}.'
 
-    print(f'Can parse {filetype}')
-    print(f'   {parser=}')
-    print(f'   {parser.language=}')
-
-    store = buf.store('tree-sitter')
-    store.listener = listen.Listener(buf, parser)
-
-    st = '%1*%<%5*%n: %f %1* %2*%m%1*%R%=%4*%15'
-    st += '{Cur_prop()}'
-    st += '%1* %3*%y%1* W=%{winwidth(0)} %8(%lx%c%) %P'
-    vim.current.window.options.statusline = st
+    store = buf.retrieve_store('tree-sitter')
+    if store is None:
+        print(f'Can parse {filetype}')
+        print(f'   {parser=}')
+        print(f'   {parser.language=}')
+        store = buf.store('tree-sitter')
+        store.listener = listen.Listener(buf, parser)
 
     return ''
 
@@ -61,9 +61,9 @@ class TreeCommand(CommandBase):
 
     def add_arguments(self) -> None:
         """Add the arguments for this command."""
-        self.arg_parser.add_argument(
+        self.parser.add_argument(
             'start_line', type=int, help='First line of tree dump range.')
-        self.arg_parser.add_argument(
+        self.parser.add_argument(
             'end_line', type=int, help='Last line of tree dump range.')
 
     def handle_command(self, args: Namespace):
@@ -78,7 +78,7 @@ class RangesCommand(CommandBase):
 
     def add_arguments(self) -> None:
         """Add the arguments for this command."""
-        self.arg_parser.add_argument(
+        self.parser.add_argument(
             'flag', choices=['on', 'off'],
             help='Enable (on) or disable (off) tree change ranges logging.')
 
@@ -93,28 +93,68 @@ class BufchangesCommand(CommandBase):
 
     def add_arguments(self) -> None:
         """Add the arguments for this command."""
-        self.arg_parser.add_argument(
+        self.parser.add_argument(
             'flag', choices=['on', 'off'],
             help='Enable (on) or disable (off) buffer changes logging.')
 
     def handle_command(self, args: Namespace):
-        """Handle the 'Treesit deug bufchanges' command."""
+        """Handle the 'Treesit debug bufchanges' command."""
         debug = listen.debug_settings
         debug.log_buffer_changes = args.flag == 'on'
+
+
+class PerformanceCommand(CommandBase):
+    """The 'debug performance' sub-command support."""
+
+    def add_arguments(self) -> None:
+        """Add the arguments for this command."""
+        self.parser.add_argument(
+            'flag', choices=['on', 'off'],
+            help='Enable (on) or disable (off) buffer changes logging.')
+
+    def handle_command(self, args: Namespace):
+        """Handle the 'Treesit debug performance' command."""
+        debug = listen.debug_settings
+        debug.log_performance = args.flag == 'on'
 
 
 class DebugSubcommand(SubCommandBase):
     """The 'debug' sub-command support."""
 
     sub_commands = {
+        'thisline': (':simple', 'Log partial tree for this line.'),
+        'status': (':simple', 'Display current debug settings.'),
         'tree': (TreeCommand, 'Control tree dumping.'),
         'ranges': (RangesCommand, 'Turn changed ranges logging on/off.'),
         'bufchanges': (
             BufchangesCommand, 'Turn buffer change logging on/off.'),
+        'performance': (
+            PerformanceCommand, 'Turn performance logging on/off.'),
     }
 
+    def handle_thisline(self) -> None:
+        """Print partial tree showing the current line."""
+        buf = vim.current.buffer
+        if store := buf.retrieve_store('tree-sitter'):
+            row, _ = vim.current.window.cursor
+            store.listener.print_tree(row, row)
+            vim.command('Vpe log show')
+        else:
+            echo_msg('Tree-sitter is not enabled for this buffer')
 
-class Plugin(TopLevelSubCommandHandler, core.CommandHandler):
+    def handle_status(self) -> None:
+        """Print the current debug settings."""
+        s = []
+        debug = listen.debug_settings
+        s.append('VPE-sitter status:')
+        s.append(f'    Log buffer changes:   {debug.log_buffer_changes}')
+        s.append(f'    Log changed ranges:   {debug.log_changed_ranges}')
+        s.append(f'    Tree dump line range: {debug.tree_line_start}'
+                 f' - {debug.tree_line_end}')
+        print('\n'.join(s))
+
+
+class Plugin(TopLevelSubCommandHandler):
     """The plug-in, which provides the commands."""
 
     sub_commands = {
@@ -122,45 +162,9 @@ class Plugin(TopLevelSubCommandHandler, core.CommandHandler):
         'debug': (DebugSubcommand, 'Control debugging logging.'),
     }
 
-    def __init__(self, command_name: str):
-        super().__init__(command_name=command_name)
-        self.auto_define_commands()
-        self._init_completion()
-
-    @command_handler('Treesit', bar=True)
-    def handle_sub_command(self, *cmd_args):
-        """Parse and execute a Treesit command."""
-        sub_cmd, args = self.sub_command_parser.parse_args(cmd_args)
-        if sub_cmd == '':
-            return
-        super().handle_sub_command(sub_cmd, args)
-
     def handle_on(self) -> None:
         """Handle the 'Treesit on' command."""
         treesit_current_buffer()
-
-    # TODO: A non-command.
-    @vpe.CommandHandler.command('Ashow', pass_info=True, range=True)
-    def ashow(self, info: vpe.CommandInfo):
-        """Execute the Ashow command."""
-        buf = vim.current.buffer
-        highlighter = buf.store('tree-sitter').highlighter
-        highlighter.log_range = range(info.line1 - 1, info.line2)
-        highlighter.dry_run = True
-        try:
-            highlighter.apply_props(range(0, len(buf)))
-        finally:
-            highlighter.log_range = None
-            highlighter.dry_run = False
-
-    # TODO: A non-command.
-    @vpe.CommandHandler.command('Ainfo', pass_info=True)
-    def ainfo(self, _info: vpe.CommandInfo):
-        """Execute the Ainfo command."""
-        buf = vim.current.buffer
-        lnum, _ = vim.current.window.cursor
-        highlighter = buf.store('tree-sitter').highlighter
-        highlighter.identify_line(lnum - 1)
 
 
 app = Plugin('Treesit')
