@@ -68,6 +68,7 @@ class TreeCommand(CommandBase):
 
     def handle_command(self, args: Namespace):
         """Handle the 'Treesit debug tree' command."""
+        print("HANDLE TREE", args)
         debug = listen.debug_settings
         debug.tree_line_start = args.start_line
         debug.tree_line_end = args.end_line
@@ -136,9 +137,11 @@ class DebugSubcommand(SubCommandBase):
         """Print partial tree showing the current line."""
         buf = vim.current.buffer
         if store := buf.retrieve_store('tree-sitter'):
-            row, _ = vim.current.window.cursor
-            store.listener.print_tree(row, row)
             vim.command('Vpe log show')
+            row, _ = vim.current.window.cursor
+            print("HI")
+            store.listener.print_tree(row, row)
+            print("--")
         else:
             echo_msg('Tree-sitter is not enabled for this buffer')
 
@@ -154,12 +157,29 @@ class DebugSubcommand(SubCommandBase):
         print('\n'.join(s))
 
 
+class PauseCommand(CommandBase):
+    """The 'pause' sub-command support."""
+
+    def add_arguments(self) -> None:
+        """Add the arguments for this command."""
+        self.parser.add_argument(
+            'flag', choices=['on', 'off'],
+            help='Pause (on) or resume (off) active sitting.')
+
+    def handle_command(self, args: Namespace):
+        """Handle the 'Treesit pause' command."""
+        buf = vim.current.buffer
+        if store := buf.retrieve_store('tree-sitter'):
+            store.listener.pause(args.flag == 'on')
+
+
 class Plugin(TopLevelSubCommandHandler):
     """The plug-in, which provides the commands."""
 
     sub_commands = {
         'on': (':simple', 'Turn on tree sitting for the current buffer.'),
         'debug': (DebugSubcommand, 'Control debugging logging.'),
+        'pause': (PauseCommand, 'Pause automatic parsing (for debug use).'),
     }
 
     def handle_on(self) -> None:

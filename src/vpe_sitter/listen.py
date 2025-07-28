@@ -17,7 +17,7 @@ from tree_sitter import Parser, Tree
 
 import vpe
 from vpe import EventHandler, vim
-from vpe.vpe_lib import diffs
+from vpe import diffs
 
 #: A list of line ranges that need updating for the latest (re)parsing.
 AffectedLines: TypeAlias = list[range] | None
@@ -28,6 +28,13 @@ ParseCompleteCallback: TypeAlias = Callable[
 
 #: How long the parse tree may be 'unclean' before clients are notified.
 MAX_UNCLEAN_TIME = 0.2
+
+#: The timeout (in microseconds) for the Tree-sitter parser.
+PARSE_TIMEOUT = 20_000
+
+#: The delay (in milliseconds) before continuing a timed out Tree-sitter parse
+#: operation.
+RESUME_DELAY = 1
 
 #: A print-equivalent function that works inside Vim callbacks.
 log = functools.partial(vpe.call_soon, print)
@@ -66,6 +73,18 @@ class ActionTimer:
 
     def __init__(self):
         self.start: float = time.time()
+        self.partials: list[tuple[float, float]] = [[self.start, None]]
+
+    def pause(self) -> None:
+        """Add a pause point."""
+        a, _ = self.partials[-1]
+        b = time.time()
+        self.partials[-1] = a, b
+
+    def resume(self) -> None:
+        """Continue after a pause."""
+        if self.partials[-1][1] is not None:
+            self.partials.append((time.time(), None))
 
     def restart(self) -> None:
         """Restart this timer."""
@@ -75,6 +94,12 @@ class ActionTimer:
     def elapsed(self) -> float:
         """The current elapsed time."""
         return time.time() - self.start
+
+    @property
+    def used(self) -> float:
+        """The time used within the elapses time."""
+        times = [b - a for a, b in self.partials if b is not None]
+        return sum(times)
 
 
 class Point(NamedTuple):
@@ -165,7 +190,6 @@ class InprogressParseOperation:
     changed_ranges: list = field(default_factory=list)
     pending_changed_ranges: list = field(default_factory=list)
 
-    parse_timeouts: int = 0
     parse_time: ActionTimer | None = None
     last_clean_time: ActionTimer = field(default_factory=ActionTimer)
 
@@ -194,11 +218,10 @@ class InprogressParseOperation:
 
             self.pending_changes[:] = []
 
-        self.parser.timeout_micros = 5_000
+        self.parser.timeout_micros = PARSE_TIMEOUT
         self.lines = list(self.listener.buf)
         self.code_bytes = '\n'.join(self.lines).encode('utf-8')
         self.parse_time = ActionTimer()
-        self.parse_timeouts = 0
         self._try_parse()
 
     def add_edit(self, edit: SyntaxTreeEdit) -> None:
@@ -227,6 +250,13 @@ class InprogressParseOperation:
         self.start()
 
     def _try_parse(self, _timer: vpe.Timer | None = None) -> None:
+        """Try to parse the buffer's contents, continuing after timeouts.
+
+        This method will re-schedule itself in the event that the Tree-sitter
+        parser times out, effectivey executing parsing as a background
+        (time-sliced_ operation.
+        """
+        self.parse_time.resume()
         try:
             if self.tree is not None:
                 tree = self.parser.parse(
@@ -236,17 +266,21 @@ class InprogressParseOperation:
 
         except ValueError:
             # The only known cause is a timeout.
+            self.parse_time.pause()
             self._schedule_reparse()
-            self.parse_timeouts += 1
 
         else:
+            self.parse_time.pause()
             if self.timer:
                 self.timer = None
             self._handle_parse_completion(tree)
 
     def _handle_parse_completion(self, tree: Tree) -> None:
 
-        parse_time = self.parse_time.elapsed
+        elapsed = self.parse_time.elapsed
+        used = self.parse_time.used
+        time_str = f'{elapsed=:.4f}s, {used=:.4f}s'
+        time_str += f' continuations={len(self.parse_time.partials) - 1}'
         self.parse_time = None
 
         def build_changed_ranges() -> list[range]:
@@ -270,7 +304,7 @@ class InprogressParseOperation:
             # Parsing has completed without any intervening buffer changes.
             if debug_settings.log_performance:
                 print(
-                    f'Tree-sitter parsed cleanly in {parse_time:.4f}s')
+                    f'Tree-sitter parsed cleanly in {time_str}')
             self.last_clean_time.restart()
             changed_ranges = build_changed_ranges()
             self.tree = tree
@@ -282,10 +316,10 @@ class InprogressParseOperation:
         else:
             # The new tree is not clean. If not too much time has elapsed,
             # parse again to catch up.
-            if self.last_clean_time.elapsed + parse_time < MAX_UNCLEAN_TIME:
+            if self.last_clean_time.elapsed + elapsed < MAX_UNCLEAN_TIME:
                 if debug_settings.log_performance:
                     print(
-                        f'Tree-sitter parsed uncleanly in {parse_time:.4f}s,'
+                        f'Tree-sitter parsed uncleanly in {time_str},'
                         ' trying to catch up.'
                     )
                 vpe.call_soon_once(id(self), self.start)
@@ -294,7 +328,7 @@ class InprogressParseOperation:
                 # date.
                 if debug_settings.log_performance:
                     print(
-                        f'Tree-sitter parse uncleanly in {parse_time:.4f}s,'
+                        f'Tree-sitter parse uncleanly in {time_str},'
                         ' too slow to try catching up.'
                     )
                 changed_ranges = build_changed_ranges()
@@ -308,8 +342,7 @@ class InprogressParseOperation:
                 vpe.call_soon_once(id(self), self.start)
 
     def _schedule_reparse(self) -> None:
-        ms_delay = 10
-        self.timer = vpe.Timer(ms_delay, self._try_parse)
+        self.timer = vpe.Timer(RESUME_DELAY, self._try_parse)
 
     def dump(
             self, tree_line_start: int | None = None,
@@ -403,7 +436,8 @@ class Listener:
             len(line.encode('utf-8')) + 1 for line in self.buf], initial=0))
 
         self.listen_handle = buf.add_listener(
-            self.handle_changes, raw_changes=False)
+            self.handle_changes, raw_changes=False, ops=False)
+        self.paused = False
         self.in_progress_parse_operation.start()
 
     @property
@@ -427,7 +461,6 @@ class Listener:
             start_lidx: int,
             end_lidx: int,
             added:int,
-            ops: list[diffs.Operation],
             vim_changes: list[dict] | None = None,
         ) -> None:
         """Process changes for the associated buffer.
@@ -439,7 +472,6 @@ class Listener:
         :start_lidx:  Start of affected line range.
         :end_lidx:    End of affected line range.
         :added:       The number of lines added or, if negative, deleted.
-        :ops:         A list of the operations applied within the line range.
         :vim_changes: The original Vim generated list of changes or None.
         """
         # pylint: disable=too-many-arguments
@@ -462,6 +494,8 @@ class Listener:
             [len(line.encode('utf-8')) + 1 for line in self.buf[start_lidx:]],
             initial=start_offset)
         )
+        if self.paused:
+            return
 
         # The new end byte offset uses the newly calculated line byte offsets.
         new_end_lidx = min(end_lidx + added, len(self.buf))
@@ -493,6 +527,15 @@ class Listener:
     def handle_bufer_reload(self) -> None:
         """React to this buffer's contents being reloaded."""
         self.in_progress_parse_operation.start_clean()
+
+    def pause(self, flag: bool) -> None:
+        """Pause or resume parsing."""
+        if self.paused and not flag:
+            self.paused = False
+            self.in_progress_parse_operation.start_clean()
+        elif flag and not self.paused:
+            self.paused = True
+        print("PAUSE", self.paused)
 
     def add_parse_complete_callback(
             self, callback: ParseCompleteCallback,
