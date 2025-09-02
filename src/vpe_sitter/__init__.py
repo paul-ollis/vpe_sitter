@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING
 
 import vpe
 from vpe import core, vim
-from vpe.argparse import (
-    CommandBase, SubCommandBase, TopLevelSubCommandHandler)
+from vpe.user_commands import (
+    CommandHandler, SubcommandHandlerBase, TopLevelSubcommandHandler)
 
 from vpe_sitter import listen, parsers
 
@@ -56,7 +56,7 @@ def treesit_current_buffer() -> str:
     return ''
 
 
-class TreeCommand(CommandBase):
+class TreeCommand(CommandHandler):
     """The 'debug tree' sub-command support."""
 
     def add_arguments(self) -> None:
@@ -68,13 +68,12 @@ class TreeCommand(CommandBase):
 
     def handle_command(self, args: Namespace):
         """Handle the 'Treesit debug tree' command."""
-        print("HANDLE TREE", args)
         debug = listen.debug_settings
         debug.tree_line_start = args.start_line
         debug.tree_line_end = args.end_line
 
 
-class RangesCommand(CommandBase):
+class RangesCommand(CommandHandler):
     """The 'debug ranges' sub-command support."""
 
     def add_arguments(self) -> None:
@@ -89,7 +88,7 @@ class RangesCommand(CommandBase):
         debug.log_changed_ranges = args.flag == 'on'
 
 
-class BufchangesCommand(CommandBase):
+class BufchangesCommand(CommandHandler):
     """The 'debug bufchanges' sub-command support."""
 
     def add_arguments(self) -> None:
@@ -104,7 +103,7 @@ class BufchangesCommand(CommandBase):
         debug.log_buffer_changes = args.flag == 'on'
 
 
-class PerformanceCommand(CommandBase):
+class PerformanceCommand(CommandHandler):
     """The 'debug performance' sub-command support."""
 
     def add_arguments(self) -> None:
@@ -119,10 +118,10 @@ class PerformanceCommand(CommandBase):
         debug.log_performance = args.flag == 'on'
 
 
-class DebugSubcommand(SubCommandBase):
+class DebugSubcommand(SubcommandHandlerBase):
     """The 'debug' sub-command support."""
 
-    sub_commands = {
+    subcommands = {
         'thisline': (':simple', 'Log partial tree for this line.'),
         'status': (':simple', 'Display current debug settings.'),
         'tree': (TreeCommand, 'Control tree dumping.'),
@@ -133,7 +132,7 @@ class DebugSubcommand(SubCommandBase):
             PerformanceCommand, 'Turn performance logging on/off.'),
     }
 
-    def handle_thisline(self) -> None:
+    def handle_thisline(self, _args: Namespace) -> None:
         """Print partial tree showing the current line."""
         buf = vim.current.buffer
         if store := buf.retrieve_store('tree-sitter'):
@@ -145,19 +144,20 @@ class DebugSubcommand(SubCommandBase):
         else:
             echo_msg('Tree-sitter is not enabled for this buffer')
 
-    def handle_status(self) -> None:
+    def handle_status(self, _args: Namespace) -> None:
         """Print the current debug settings."""
         s = []
         debug = listen.debug_settings
         s.append('VPE-sitter status:')
-        s.append(f'    Log buffer changes:   {debug.log_buffer_changes}')
-        s.append(f'    Log changed ranges:   {debug.log_changed_ranges}')
+        s.append(f'    Log performance:      {debug.log_performance}')
+        s.append(f'    Log bufchanges:       {debug.log_buffer_changes}')
+        s.append(f'    Log ranges:           {debug.log_changed_ranges}')
         s.append(f'    Tree dump line range: {debug.tree_line_start}'
-                 f' - {debug.tree_line_end}')
+                 f' --> {debug.tree_line_end}')
         print('\n'.join(s))
 
 
-class PauseCommand(CommandBase):
+class PauseCommand(CommandHandler):
     """The 'pause' sub-command support."""
 
     def add_arguments(self) -> None:
@@ -173,36 +173,39 @@ class PauseCommand(CommandBase):
             store.listener.pause(args.flag == 'on')
 
 
-class Plugin(TopLevelSubCommandHandler):
+class TrackCommand(CommandHandler):
+    """The 'track' sub-command support."""
+
+    def add_arguments(self) -> None:
+        """Add the arguments for this command."""
+        self.parser.add_argument(
+            'flag', choices=['on', 'off'],
+            help='Enable or disable detail change track logging.')
+
+    def handle_command(self, args: Namespace):
+        """Handle the 'Treesit track' command."""
+        listen.Listener.track(args.flag == 'on')
+
+
+class Plugin(TopLevelSubcommandHandler):
     """The plug-in, which provides the commands."""
 
-    sub_commands = {
+    subcommands = {
         'on': (':simple', 'Turn on tree sitting for the current buffer.'),
         'debug': (DebugSubcommand, 'Control debugging logging.'),
         'pause': (PauseCommand, 'Pause automatic parsing (for debug use).'),
+        # This command provides very detailed logging about Vim reported
+        # changes and stores buffer contents in a Git repository for *every
+        # single* change reported by Vim. It will create and also **delete**
+        # the directory $HOME/tmp/ts_log, using shutil.rmtree. So enable and
+        # use this at your own risk.
+        #-'track':
+        #-    (TrackCommand, 'For debug only: control change tracking.'),
     }
 
-    def handle_on(self) -> None:
+    def handle_on(self, _args: Namespace) -> None:
         """Handle the 'Treesit on' command."""
         treesit_current_buffer()
 
 
 app = Plugin('Treesit')
-
-_CUR_PROP = """
-function! Cur_prop()
-    let props = prop_list(line('.'))
-    let col = col('.')
-    let found = []
-    for prop in props
-        let pcol = prop['col']
-        let plen = prop['length']
-        if pcol <= col && (pcol + plen) > col
-            call add(found, get(prop, 'type', '-'))
-        endif
-    endfor
-    return found
-endfunction
-"""
-
-vim.command(_CUR_PROP)

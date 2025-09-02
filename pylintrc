@@ -19,10 +19,7 @@ ignore-patterns=
 # Python code to execute, usually for sys.path manipulation such as
 # pygtk.require().
 init-hook=import os, os.path; sys.path[0:0] = [
-        os.path.expanduser('~/.vim/pack/vim-vpe'),
-#        os.path.abspath('../../vim-vpe/stub'),
-#        os.path.abspath('../..'),
-        os.path.abspath('.'),
+        os.path.abspath('src'),
     ]
 
 # Use multiple processes to speed up Pylint. Specifying 0 will auto-detect the

@@ -18,6 +18,7 @@ classifiers = [
     "Topic :: Education",
 ]
 dependencies = [
+    'tree-sitter==0.24.0',
 ]
 
 # [tool.setuptools.packages.find]
@@ -27,7 +28,7 @@ dependencies = [
 # where = ["src"]
 
 [tool.setuptools.package-data]
-'vpe_sitter.resources.tree_sitter_queries' = ['*.scm']
+'vpe_sitter' = ['py.typed']
 
 [project.scripts]
 
@@ -74,7 +75,8 @@ ignore = [
     "T20",     # Allow the print function to be used.
 
 
-    # A bunch of warnings about logging, for whcih Ruff uses heruistics.
+    # A bunch of warnings about logging, for which Ruff uses annoying
+    # heuristics.
     # "R010",    # Use of 'warn' instead of 'warning'.
     "G004",    # Ruff uses dumb heuristics and rules for logging.
 
