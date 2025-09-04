@@ -61,7 +61,7 @@ class DebugSettings:
 
     @property
     def active(self) -> bool:
-        """Flag indicating that some debuggin is active."""
+        """Flag indicating that some debugging is active."""
         if self.dump_tree:
             return True
         flag = self.log_changed_ranges or self.log_buffer_changes
@@ -80,7 +80,11 @@ class ConditionCode(Enum):
 class ActionTimer:
     """A class that times how long something takes.
 
-    @start: Start time, in seconds, for this timer.
+    @start:
+        Start time, in seconds, for this timer.
+    @partials:
+        A list of (start, stop) times which capture the active periods
+        between pauses.
     """
 
     def __init__(self):
@@ -102,11 +106,17 @@ class ActionTimer:
     def restart(self) -> None:
         """Restart this timer."""
         self.start = time.time()
+        self.partials = [(self.start, None)]
         self.active = True
 
     def stop(self) -> None:
         """Stop this timer."""
         self.active = False
+
+    @property
+    def paused(self) -> bool:
+        """Test if this timer is currently paused."""
+        return self.active and self.partials[-1][1] is not None
 
     @property
     def elapsed(self) -> float:
@@ -146,9 +156,9 @@ class SyntaxTreeEdit(NamedTuple):
         a, _ = self.start_point
         c, _ = self.old_end_point
         e, _ = self.new_end_point
-        frm = f'{a+1}'
-        old_to = f'{c+1}'
-        new_to = f'{e+1}'
+        frm = f'{a}'
+        old_to = f'{c}'
+        new_to = f'{e}'
         return f'Bytes: {bb} / Lines: {frm} => {old_to}->{new_to}'
 
 
@@ -191,8 +201,8 @@ class InprogressParseOperation:
         the next parsing run can be started.
     @tree:
         The tree resulting from the last (re)parsing run. Initially ``None``.
-    @timer:
-        A `vpe.Timer` use to continue a long parse operation.
+    @continuation_timer:
+        A `vpe.Timer` used to continue a long parse operation.
     @parse_done_callback:
         A function to be invoked when a (re)parsing has completed.
     """
@@ -204,7 +214,7 @@ class InprogressParseOperation:
     lines: list[str] = field(default_factory=list)
     pending_changes: list[SyntaxTreeEdit] = field(default_factory=list)
     tree: Tree | None = None
-    timer: vpe.Timer | None = None
+    continuation_timer: vpe.Timer | None = None
     changed_ranges: list = field(default_factory=list)
     pending_changed_ranges: list = field(default_factory=list)
 
@@ -219,10 +229,20 @@ class InprogressParseOperation:
         """Flag that is ``True`` when parsing is ongoing."""
         return self.parse_time.active
 
+    @property
+    def paused(self) -> bool:
+        """Flag that is ``True`` when parsing has paused."""
+        return self.parse_time.paused
+
     def start(self) -> None:
         """Start a new parsing operation."""
         if self.active:
             return
+
+        if self.continuation_timer is None:
+            self.continuation_timer = vpe.Timer(
+                RESUME_DELAY, self._continue_parse, repeat=-1)
+            self.continuation_timer.pause()
 
         if self.pending_changes:
             self.pending_changed_ranges[:] = []
@@ -261,9 +281,8 @@ class InprogressParseOperation:
         Any in-progress build is abandoned, pending changes are discarded and
         a new tree construction is started.
         """
-        if self.timer:
-            self.timer.stop()
-            self.timer = None
+        if self.continuation_timer is not None:
+            self.continuation_timer.pause()
         self.pending_changes[:] = []
         self.tree = None
         self.start()
@@ -286,12 +305,12 @@ class InprogressParseOperation:
         except ValueError:
             # The only known cause is a timeout.
             self.parse_time.pause()
-            self._schedule_reparse()
+            self._schedule_continuation()
 
         else:
             self.parse_time.pause()
-            if self.timer:
-                self.timer = None
+            if self.continuation_timer:
+                self.continuation_timer.pause()
             self._handle_parse_completion(tree)
 
     def _handle_parse_completion(self, tree: Tree) -> None:
@@ -305,18 +324,25 @@ class InprogressParseOperation:
 
         def build_changed_ranges() -> list[range]:
             if self.tree:
-                ranges = [
+                tree_ranges = [
                     range(r.start_point.row, r.end_point.row + 1)
                     for r in self.tree.changed_ranges(tree)
                 ]
-                self.tree_ranges = ranges
-                ranges = merge_ranges(ranges, self.pending_changed_ranges)
-                self.pending_changed_ranges[:] = []
+                vim_ranges = self.pending_changed_ranges
+                self.tree_ranges = tree_ranges
+                ranges = merge_ranges(tree_ranges, vim_ranges)
                 if debug_settings.log_changed_ranges:
-                    s = [f'Tree-siter reports {len(ranges)} changes:']
+                    s = [f'Tree-siter reports {len(tree_ranges)} changes:']
+                    for r in tree_ranges:
+                        s.append(f'    {r}')
+                    s.append(f'Vim reported {len(vim_ranges)} changes:')
+                    for r in vim_ranges:
+                        s.append(f'    {r}')
+                    s.append(f'Merged {len(ranges)} changes:')
                     for r in ranges:
                         s.append(f'    {r}')
                     log('\n'.join(s))
+                self.pending_changed_ranges[:] = []
             else:
                 ranges = []
             return ranges
@@ -367,8 +393,19 @@ class InprogressParseOperation:
                 # ... and parse the changed code.
                 vpe.call_soon_once(id(self), self.start)
 
-    def _schedule_reparse(self) -> None:
-        self.timer = vpe.Timer(RESUME_DELAY, self._try_parse)
+    def _schedule_continuation(self) -> None:
+        """Schedule a continuation of the current parse operation."""
+        if self.continuation_timer is None:
+            self.continuation_timer = vpe.Timer(
+                RESUME_DELAY, self._continue_parse, repeat=-1)
+        self.continuation_timer.resume()
+
+    def _continue_parse(self, _timer):
+        """Continue parsing if suspended due to a timeout."""
+        if self.continuation_timer:
+            self.continuation_timer.pause()
+        if self.paused:
+            self._try_parse()
 
     def dump(self, tree_line_start: int = -1, tree_line_end: int = -1):
         """Dump a representaion of part of the tree."""
@@ -569,7 +606,7 @@ class Listener:
         )
         if debug_settings.log_buffer_changes:
             s = []
-            s.append('Handlechange:')
+            s.append('Handle change:')
             s.append(f'   Lines: {start_lidx+1} {end_lidx+1} {added}')
             s.append(f'   Edit:  {edit.format_1()}')
             log('\n'.join(s))

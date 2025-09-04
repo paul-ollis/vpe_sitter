@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import vpe
 from vpe import core, vim
+from vpe.core import log
 from vpe.user_commands import (
     CommandHandler, SubcommandHandlerBase, TopLevelSubcommandHandler)
 
@@ -31,7 +32,7 @@ def treesit_current_buffer() -> str:
     remains responsive.
 
     :return:
-        An error message id parsing is not possible. An empty string if
+        An error message if parsing is not possible. An empty string if
         successful.
     """
     buf = vim.current.buffer
@@ -47,9 +48,9 @@ def treesit_current_buffer() -> str:
 
     store = buf.retrieve_store('tree-sitter')
     if store is None:
-        print(f'Can parse {filetype}')
-        print(f'   {parser=}')
-        print(f'   {parser.language=}')
+        log(f'Can parse {filetype}')
+        log(f'   {parser=}')
+        log(f'   {parser.language=}')
         store = buf.store('tree-sitter')
         store.listener = listen.Listener(buf, parser)
 
@@ -138,9 +139,7 @@ class DebugSubcommand(SubcommandHandlerBase):
         if store := buf.retrieve_store('tree-sitter'):
             vim.command('Vpe log show')
             row, _ = vim.current.window.cursor
-            print("HI")
             store.listener.print_tree(row, row)
-            print("--")
         else:
             echo_msg('Tree-sitter is not enabled for this buffer')
 
@@ -154,7 +153,7 @@ class DebugSubcommand(SubcommandHandlerBase):
         s.append(f'    Log ranges:           {debug.log_changed_ranges}')
         s.append(f'    Tree dump line range: {debug.tree_line_start}'
                  f' --> {debug.tree_line_end}')
-        print('\n'.join(s))
+        log('\n'.join(s))
 
 
 class PauseCommand(CommandHandler):

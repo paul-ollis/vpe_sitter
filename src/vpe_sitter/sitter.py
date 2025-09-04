@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from tree_sitter import Language
 
+from vpe.core import log
+
 ts_dir = Path('/home/paul/np/os/tree-sitter')
 ts_parsers_dir = ts_dir / 'parsers'
 
@@ -42,7 +44,7 @@ def dump_node_names(lang: str):
             names.add(name)
 
     for name in sorted(names):
-        print(name)
+        log(name)
 
 
 if __name__ == '__main__':
