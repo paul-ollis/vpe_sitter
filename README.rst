@@ -9,7 +9,7 @@
 Welcome to the Tree-sitter support for Vim.
 
 :status:
-    This is version 0.1.0
+    This is version 0.1.1
 
     This is alpha software, but I use it all the time for syntax highlighting
     and it has been behaving reliably for me.
