@@ -48,9 +48,9 @@ def treesit_current_buffer() -> str:
 
     store = buf.retrieve_store('tree-sitter')
     if store is None:
-        log(f'Can parse {filetype}')
-        log(f'   {parser=}')
-        log(f'   {parser.language=}')
+        log(f'VPE-sitter: Can parse {filetype}')
+        log(f'VPE-sitter:    {parser=}')
+        log(f'VPE-sitter:    {parser.language=}')
         store = buf.store('tree-sitter')
         store.listener = listen.Listener(buf, parser)
 
@@ -119,18 +119,34 @@ class PerformanceCommand(CommandHandler):
         debug.log_performance = args.flag == 'on'
 
 
+class DebugAllCommand(CommandHandler):
+    """The 'debug all' sub-command support."""
+
+    def add_arguments(self) -> None:
+        """Add the arguments for this command."""
+        self.parser.add_argument(
+            'flag', choices=['on', 'off'],
+            help='Enable (on) or disable (off) all logging.')
+
+    def handle_command(self, args: Namespace):
+        """Handle the 'Treesit debug performance' command."""
+        listen.debug_settings.set_all(args.flag == 'on')
+
+
 class DebugSubcommand(SubcommandHandlerBase):
     """The 'debug' sub-command support."""
 
     subcommands = {
-        'thisline': (':simple', 'Log partial tree for this line.'),
-        'status': (':simple', 'Display current debug settings.'),
-        'tree': (TreeCommand, 'Control tree dumping.'),
+        'all': (
+            DebugAllCommand, 'Turn all logging on/off.'),
         'ranges': (RangesCommand, 'Turn changed ranges logging on/off.'),
         'bufchanges': (
             BufchangesCommand, 'Turn buffer change logging on/off.'),
         'performance': (
             PerformanceCommand, 'Turn performance logging on/off.'),
+        'status': (':simple', 'Display current debug settings.'),
+        'thisline': (':simple', 'Log partial tree for this line.'),
+        'tree': (TreeCommand, 'Control tree dumping.'),
     }
 
     def handle_thisline(self, _args: Namespace) -> None:

@@ -68,6 +68,12 @@ class DebugSettings:
         flag = flag or self.log_performance
         return flag
 
+    def set_all(self, flag: bool) -> None:
+        """Set all debug flags on or off."""
+        self.log_buffer_changes = flag
+        self.log_changed_ranges = flag
+        self.log_performance = flag
+
 
 class ConditionCode(Enum):
     """Condition codes informing clients of parse tree or buffer changes."""
@@ -239,11 +245,6 @@ class InprogressParseOperation:
         if self.active:
             return
 
-        if self.continuation_timer is None:
-            self.continuation_timer = vpe.Timer(
-                RESUME_DELAY, self._continue_parse, repeat=-1)
-            self.continuation_timer.pause()
-
         if self.pending_changes:
             self.pending_changed_ranges[:] = []
             if self.tree is not None:
@@ -281,8 +282,6 @@ class InprogressParseOperation:
         Any in-progress build is abandoned, pending changes are discarded and
         a new tree construction is started.
         """
-        if self.continuation_timer is not None:
-            self.continuation_timer.pause()
         self.pending_changes[:] = []
         self.tree = None
         self.start()
@@ -303,14 +302,13 @@ class InprogressParseOperation:
                 tree = self.parser.parse(self.code_bytes, encoding='utf-8')
 
         except ValueError:
-            # The only known cause is a timeout.
+            # The only known cause is a timeout. The exception object does not
+            # provide useful diagnostics, so we simple have to assume.
             self.parse_time.pause()
             self._schedule_continuation()
 
         else:
             self.parse_time.pause()
-            if self.continuation_timer:
-                self.continuation_timer.pause()
             self._handle_parse_completion(tree)
 
     def _handle_parse_completion(self, tree: Tree) -> None:
@@ -395,15 +393,10 @@ class InprogressParseOperation:
 
     def _schedule_continuation(self) -> None:
         """Schedule a continuation of the current parse operation."""
-        if self.continuation_timer is None:
-            self.continuation_timer = vpe.Timer(
-                RESUME_DELAY, self._continue_parse, repeat=-1)
-        self.continuation_timer.resume()
+        self.continuation_timer = vpe.Timer(RESUME_DELAY, self._continue_parse)
 
     def _continue_parse(self, _timer):
         """Continue parsing if suspended due to a timeout."""
-        if self.continuation_timer:
-            self.continuation_timer.pause()
         if self.paused:
             self._try_parse()
 

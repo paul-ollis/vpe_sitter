@@ -34,7 +34,7 @@ This library provides a mechanism to associate a Tree-sitter parse tree with any
 buffer that displays a supported language. Client code of this library can
 register to receive callbacks whenever the tree has been updated.
 
-The following example demonstrate the main parts of the API. First tree-sitter
+The following example demonstrates the main parts of the API. First tree-sitter
 must be enabled for a buffer.
 
 .. code:: python
