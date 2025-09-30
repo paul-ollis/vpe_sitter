@@ -170,7 +170,7 @@ def main(args: argparse.Namespace) -> None:
                 'tree-sitter-python==0.23.6', 'tree-sitter-c==0.21.4']):
             sys.exit(1)
 
-    # Finally, makes sure that the VPE plugin is correctly installed.
+    # Finally, make sure that the VPE plugin is correctly installed.
     print("Ensuring VPE's plugin code is installed...")
     install_vpe_plugin(vim_prog)
 

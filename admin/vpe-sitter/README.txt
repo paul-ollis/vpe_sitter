@@ -3,14 +3,14 @@
 This is a minimal download that provides a Python script to install VPE-Sitter.
 The script also tries to automate setting up the dependencies; in particular
 VPE. I cannot guarantee that the script will work reliably, especially on
-Windows. So you may need to falback to a manual installation. However, I would
+Windows. So you may need to fallback to a manual installation. However, I would
 be pleased to receive problem reports at:
 
     https://github.com/paul-ollis/vpe_sitter/issues
 
 so that I can fix any issues.
 
-The install script is "install.py". The "inst-vpe.vim" script used by
+The install script is "install.py". The "inst-vpe.vim" script is used by
 "install.py".
 
 NOTE: You must be in the same directory as this README to run the script.

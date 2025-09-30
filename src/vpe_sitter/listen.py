@@ -5,22 +5,23 @@ for buffer changes and parses the contents in response.
 """
 from __future__ import annotations
 
-import contextlib
 import functools
-import shutil
-import subprocess
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import accumulate
-from pathlib import Path
-from typing import Callable, ClassVar, Final, NamedTuple, TypeAlias
+from typing import Callable, Final, NamedTuple, TypeAlias
 from weakref import proxy
 
 from tree_sitter import Parser, Tree
 
 import vpe
 from vpe import EventHandler, vim
+
+# This is temporary. It allows experimentation with the listen_add buffering
+# work-around.
+WORKAROUND_TESTING = Path('~/WORKAROUND_TESTING').expanduser().exists()
 
 #: A list of line ranges that need updating for the latest (re)parsing.
 AffectedLines: TypeAlias = list[range] | None
@@ -158,20 +159,31 @@ class SyntaxTreeEdit(NamedTuple):
 
     def format_1(self) -> str:
         """Format contents using 1-based lines and columns."""
-        bb = f'{self.start_byte} => {self.old_end_byte}->{self.new_end_byte}'
+        bb = f'{self.start_byte}=>{self.old_end_byte}->{self.new_end_byte}'
         a, _ = self.start_point
         c, _ = self.old_end_point
         e, _ = self.new_end_point
         frm = f'{a}'
         old_to = f'{c}'
         new_to = f'{e}'
-        return f'Bytes: {bb} / Lines: {frm} => {old_to}->{new_to}'
+        return f'Bytes: {bb} / Lines: {frm}=>{old_to}->{new_to}'
 
 
 class VimEventHandler(EventHandler):
     """A global event handler for critical Vim events."""
     def __init__(self):
         self.auto_define_event_handlers('VPE_ListenEventGroup')
+        self.callbacks: dict[str, list[Callable[[], None]]] = {}
+
+    def add_callback(self, event: str, func: Callable[[], None]) -> None:
+        """Add a function to be invoked for an event."""
+        if event not in self.callbacks:
+            self.callbacks[event] = []
+        self.callbacks[event].append(func)
+
+    def _invoke_callbacks_for_event(self, event: str) -> None:
+        for func in self.callbacks.get(event, ()):
+            func()
 
     @EventHandler.handle('BufReadPost')
     def handle_buffer_content_loaded(self) -> None:
@@ -187,9 +199,19 @@ class VimEventHandler(EventHandler):
             if listener is not None:
                 listener.handle_buffer_reload()
 
+    @EventHandler.handle('SafeState')
+    def handle_safe_state(self) -> None:
+        """React to the safe state being entered."""
+        self._invoke_callbacks_for_event('SafeState')
+
+    @EventHandler.handle('SafeStateAgain')
+    def handle_safe_state_again(self) -> None:
+        """React to the safe again state being entered."""
+        self._invoke_callbacks_for_event('SafeAgainState')
+
 
 @dataclass
-class InprogressParseOperation:
+class InProgressParseOperation:
     """Data capturing a parsing operation that may be partially complete.
 
     @listener:
@@ -223,10 +245,6 @@ class InprogressParseOperation:
     continuation_timer: vpe.Timer | None = None
     changed_ranges: list = field(default_factory=list)
     pending_changed_ranges: list = field(default_factory=list)
-
-    # A hack for change tracking.
-    tree_ranges: list = field(default_factory=list)
-
     parse_time: ActionTimer = ActionTimer()
     last_clean_time: ActionTimer = field(default_factory=ActionTimer)
 
@@ -258,8 +276,7 @@ class InprogressParseOperation:
             self.pending_changes[:] = []
 
         self.parser.timeout_micros = PARSE_TIMEOUT
-        self.lines = list(self.listener.buf)
-        self.code_bytes = '\n'.join(self.lines).encode('utf-8')
+        self.code_bytes = '\n'.join(self.listener.buf).encode('utf-8')
         self.parse_time.restart()
         self._try_parse()
 
@@ -272,8 +289,6 @@ class InprogressParseOperation:
         self.pending_changes.append(edit)
         if not self.active:
             self.parse_done_callback(ConditionCode.PENDING_CHANGES, [])
-            self.listener.track_tree(
-                ConditionCode.PENDING_CHANGES, [], [])
         vpe.call_soon_once(id(self), self.start)
 
     def start_clean(self) -> None:
@@ -312,7 +327,6 @@ class InprogressParseOperation:
             self._handle_parse_completion(tree)
 
     def _handle_parse_completion(self, tree: Tree) -> None:
-
         elapsed = self.parse_time.elapsed
         used = self.parse_time.used
         if debug_settings.log_performance:
@@ -327,7 +341,6 @@ class InprogressParseOperation:
                     for r in self.tree.changed_ranges(tree)
                 ]
                 vim_ranges = self.pending_changed_ranges
-                self.tree_ranges = tree_ranges
                 ranges = merge_ranges(tree_ranges, vim_ranges)
                 if debug_settings.log_changed_ranges:
                     s = [f'Tree-siter reports {len(tree_ranges)} changes:']
@@ -357,8 +370,6 @@ class InprogressParseOperation:
                 self.dump()
             self.parse_done_callback(
                 ConditionCode.NEW_CLEAN_TREE, changed_ranges)
-            self.listener.track_tree(
-                ConditionCode.NEW_CLEAN_TREE, self.tree_ranges, changed_ranges)
 
         else:
             # The new tree is not clean. If not too much time has elapsed,
@@ -384,9 +395,6 @@ class InprogressParseOperation:
                     self.dump()
                 self.parse_done_callback(
                     ConditionCode.NEW_OUT_OF_DATE_TREE, changed_ranges)
-                self.listener.track_tree(
-                    ConditionCode.NEW_OUT_OF_DATE_TREE, self.tree_ranges,
-                    changed_ranges)
 
                 # ... and parse the changed code.
                 vpe.call_soon_once(id(self), self.start)
@@ -397,8 +405,7 @@ class InprogressParseOperation:
 
     def _continue_parse(self, _timer):
         """Continue parsing if suspended due to a timeout."""
-        if self.paused:
-            self._try_parse()
+        self._try_parse()
 
     def dump(self, tree_line_start: int = -1, tree_line_end: int = -1):
         """Dump a representaion of part of the tree."""
@@ -463,7 +470,7 @@ class Listener:
     @tree_change_callbacks:
         A list of functions to be invoked upon code tree state changes.
     @in_progress_parse_operation:
-        A `InprogressParseOperation` object that runs parse operations as
+        A `InProgressParseOperation` object that runs parse operations as
         a "background" operation.
     @byte_offsets:
         The byte offsets for the start of each line in the buffer.
@@ -472,27 +479,33 @@ class Listener:
     """
     # pylint: disable=too-many-instance-attributes
     listen_handle: vpe.BufListener
-    in_progress_parse_operation: InprogressParseOperation
+    in_progress_parse_operation: InProgressParseOperation
     vim_event_handler: Final = VimEventHandler()
-    tracker: ClassVar[Tracker | None] = None
 
     def __init__(self, buf: vpe.Buffer, parser: Parser):
         self.buf = buf
         self.reload_count = 0
         self.parser: Parser = parser
+        self.track_buf = list(self.buf)
+        self.change_info = [-1, -1, len(self.track_buf)]
+        self.ch_indices: list[None | int] = []
         self.tree_change_callbacks: list[ParseCompleteCallback] = []
-        self.in_progress_parse_operation = InprogressParseOperation(
+        self.in_progress_parse_operation = InProgressParseOperation(
             proxy(self), self.parser, self.handle_parse_complete)
 
         # On my computer, this code is over 10 times faster than using Vim's
         # line2byte function.
         self.byte_offsets = list(accumulate([
-            len(line.encode('utf-8')) + 1 for line in self.buf], initial=0))
+            len(line.encode('utf-8')) + 1
+            for line in self.track_buf], initial=0))
 
+        unbuffered = not WORKAROUND_TESTING
         self.listen_handle = buf.add_listener(
-            self.handle_changes, raw_changes=True, ops=False)
-        self.paused = False
+            self.handle_changes, ops=False, unbuffered=unbuffered)
+        self.buffered_changes: list = []
         self.in_progress_parse_operation.start()
+        self.vim_event_handler.add_callback(
+            'SafeAgainState', self._apply_changes)
 
     @property
     def tree(self) -> Tree | None:
@@ -518,7 +531,6 @@ class Listener:
             start_lidx: int,
             end_lidx: int,
             added:int,
-            raw_changes: list[dict] | tuple = (),
         ) -> None:
         """Process changes for the associated buffer.
 
@@ -554,17 +566,45 @@ class Listener:
         :end_lidx:    End of affected line range.
         :added:       The number of lines added or, if negative, deleted.
         """
-        # pylint: disable=too-many-arguments
-        # pylint: disable=too-many-locals,too-many-positional-arguments
-        if self.tracker:
-            args = start_lidx, end_lidx, added
-            raw_changes = [dict(ch) for ch in raw_changes]
+
+        # Apply the changes to the shadow buffer.
+        a, b, n = start_lidx, end_lidx, added
+        if self.change_info[0] < 0:
+            self.change_info[:2] = [a, b]
+            self.ch_indices = list(range(len(self.track_buf)))
+
+        if n == 0:
+            start = self.ch_indices[a]
+            end = self.ch_indices[b]
+            self.track_buf[a:b] = self.buf[a:b]
+        elif n > 0:
+            start = self.ch_indices[a]
+            end = self.ch_indices[b]
+            self.track_buf[a:b] = self.buf[a:b + n]
+            self.ch_indices[b:b] = [None] * n
+        else:
+            start = self.ch_indices[a]
+            end = self.ch_indices[b - n]
+            self.track_buf[a:b - n] = self.buf[a:b]
+            del self.ch_indices[b:b - n]
+
+        if start is not None:
+            self.change_info[0] = min(self.change_info[0], start)
+        if end is not None:
+            self.change_info[1] = max(self.change_info[1], end)
+
+    def _do_apply_changes(
+            self, start_lidx: int, end_lidx: int, added: int) -> None:
+        """Tell the `InProgressParseOperation` about recent tracked changes."""
 
         # Special handling is required if Vim reports added lines starting
         # past the end of the buffer. This happens when, for example, when
         # executing normal('o') while on the last line.
-        if start_lidx == len(self.byte_offsets) - 1:
-            start_lidx = max(0, start_lidx - 1)
+        if start_lidx >= len(self.byte_offsets) - 1:
+            start_lidx = max(0, len(self.byte_offsets) - 2)
+
+        # TODO: Why is the next line required?
+        end_lidx = min(end_lidx, len(self.byte_offsets))
 
         # The start offset and old end byte offset depend on the previously
         # calculated line byte offsets.
@@ -575,13 +615,13 @@ class Listener:
         # contents.
         start_offset = self.byte_offsets[start_lidx]
         self.byte_offsets[start_lidx:] = list(accumulate(
-            [len(line.encode('utf-8')) + 1 for line in self.buf[start_lidx:]],
+            [len(line.encode('utf-8')) + 1
+             for line in self.track_buf[start_lidx:]],
             initial=start_offset)
         )
-        if self.paused:
-            return
 
-        # The new end byte offset uses the newly calculated line byte offsets.
+        # The new end byte offset uses the newly calculated line byte
+        # offsets.
         new_end_lidx = min(end_lidx + added, len(self.buf))
         new_end_byte = self.byte_offsets[new_end_lidx]
 
@@ -590,9 +630,10 @@ class Listener:
         old_end_point = Point(end_lidx, 0)
         new_end_point = Point(new_end_lidx, 0)
 
-        # Update the parsing controller's pending edits. This will typically
-        # trigger an immediate incremental Tree-sitter reparse, but reparsing
-        # may be delayed by an already in progress parse operation.
+        # Update the parsing controller's pending edits. This will
+        # typically trigger an immediate incremental Tree-sitter reparse,
+        # but reparsing may be delayed by an already in progress parse
+        # operation.
         edit = SyntaxTreeEdit(
             start_byte, old_end_byte, new_end_byte,
             start_point, old_end_point, new_end_point,
@@ -600,28 +641,45 @@ class Listener:
         if debug_settings.log_buffer_changes:
             s = []
             s.append('Handle change:')
-            s.append(f'   Lines: {start_lidx+1} {end_lidx+1} {added}')
-            s.append(f'   Edit:  {edit.format_1()}')
+            s.append(f'   Line (range): {start_lidx+1}=>{end_lidx+1} {added}')
+            s.append(f'   Edit:         {edit.format_1()}')
             log('\n'.join(s))
 
         self.in_progress_parse_operation.add_edit(edit)
 
-        if self.tracker:
-            self.tracker.add_record(self.buf, args, edit, raw_changes)
+    def _apply_changes(self):
+        """Process accumulated tracked changes."""
+        start_lidx, end_lidx, old_len = self.change_info
+        if start_lidx < 0:
+            return
+
+        added = len(self.track_buf) - old_len
+        failed = False
+        if len(self.buf) != len(self.track_buf):
+            print(f'TRACK FAIL: {len(self.buf)=} {len(self.track_buf)=}')
+            failed = True
+        else:
+            for i, (a, b) in enumerate(zip(self.buf, self.track_buf)):
+                if a != b:
+                    print(
+                        f'TRACK FAIL: line={i}'
+                        f'\n    buf    ={a!r}'
+                        f'\n    tracked={b!r}')
+                    failed = True
+                    break
+
+        if failed:
+            self.in_progress_parse_operation.start_clean()
+            self.track_buf = list(self.buf)
+        else:
+            self._do_apply_changes(start_lidx, end_lidx, added)
+        self.change_info = [-1, -1, len(self.track_buf)]
 
     def handle_buffer_reload(self) -> None:
         """React to this buffer's contents being reloaded."""
         if debug_settings.active:
             log('Start clean parse due to buffer load')
         self.in_progress_parse_operation.start_clean()
-
-    def pause(self, flag: bool) -> None:
-        """Pause or resume parsing."""
-        if self.paused and not flag:
-            self.paused = False
-            self.in_progress_parse_operation.start_clean()
-        elif flag and not self.paused:
-            self.paused = True
 
     def add_parse_complete_callback(
             self, callback: ParseCompleteCallback,
@@ -636,101 +694,6 @@ class Listener:
     def print_tree(self, tree_line_start: int, tree_line_end: int):
         """Print part of the syntax tree for this buffer."""
         self.in_progress_parse_operation.dump(tree_line_start, tree_line_end)
-    @classmethod
-    def track(cls, flag: bool) -> None:
-        """Start or stop detailed change tracking."""
-        if flag:
-            if not cls.tracker:
-                cls.tracker = Tracker()
-        else:
-            cls.tracker = None
-
-    def track_tree(
-            self,
-            code: ConditionCode,
-            tree_lines: AffectedLines,
-            all_lines: AffectedLines
-        ) -> None:
-        """Add a tree tracking record."""
-        if self.tracker:
-            self.tracker.track_tree(self.buf, code, tree_lines, all_lines)
-
-
-class Tracker:
-    """Class to manage the detail change tracking log."""
-
-    def __init__(self):
-        self.track_dir = Path('~/tmp/ts_log').expanduser()
-        if self.track_dir.exists():
-            shutil.rmtree(self.track_dir)
-        self.track_dir.mkdir(exist_ok=True)
-
-        ignore_path = self.track_dir / '.gitignore'
-        ignore_path.write_text('log.txt')
-
-        self.log_path = self.track_dir / 'log.txt'
-        self.log_file = self.log_path.open(
-            mode='wt', encoding='utf-8', buffering=1)
-        self.log_file.write('log.txt\n')
-        self.file_map: dict[str, str] = {}
-
-        self.exec_git(['git', 'init'])
-        self.exec_git(['git', 'add', str(ignore_path)])
-        self.exec_git(['git', 'commit', '-am', 'Started'])
-
-    def add_record(self, buf, args, edit, raw_changes):
-        """Add a tracker record."""
-        buf_path = Path(buf.name)
-        if buf.name not in self.file_map:
-            pathname = f'F{len(self.file_map)}_{buf_path.name}'
-            self.file_map[buf.name] = pathname
-        pathname = self.file_map[buf.name]
-        with contextlib.chdir(self.track_dir):
-            with open(pathname, mode='wt', encoding='utf-8') as f:
-                f.write('\n'.join(buf))
-                f.write('\n')
-
-        self.exec_git(['git', 'add', pathname])
-        self.exec_git(['git', 'commit', '-m', f'Record {buf.name}'])
-        text = self.exec_git(['git', 'log', '-1', '--oneline'])
-        commit = text.split(None, 1)[0]
-
-        self.log_file.writelines([
-            f'Commit: {commit}\n',
-            f'Args: {args}\n',
-            f'Edit: {edit}\n',
-            f'Raw: {raw_changes}\n',
-        ])
-
-    def track_tree(
-            self,
-            buf,
-            code: ConditionCode,
-            tree_lines: AffectedLines,
-            all_lines: AffectedLines
-        ) -> None:
-        """Add a tree tracking record."""
-        buf_path = Path(buf.name)
-        if buf.name not in self.file_map:
-            pathname = f'F{len(self.file_map)}_{buf_path.name}'
-            self.file_map[buf.name] = pathname
-        pathname = self.file_map[buf.name]
-        self.log_file.writelines([
-            f'File: {pathname}\n',
-            f'Code: {code}\n',
-            f'Tree_lines: {tree_lines}\n',
-            f'All_lines: {all_lines}\n',
-        ])
-
-    def exec_git(self, args: list[str]) -> str:
-        """Execute a git command, logging any errors."""
-        execute = functools.partial(
-            subprocess.run, capture_output=True, encoding='utf-8', errors='ignore')
-        with contextlib.chdir(self.track_dir):
-            res = execute(args)
-        if res.stderr:
-            log(res.stderr)
-        return res.stdout
 
 
 def merge_ranges(ranges_a: list[range], ranges_b: list[range]) -> list[range]:
