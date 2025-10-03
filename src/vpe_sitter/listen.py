@@ -481,15 +481,16 @@ class Listener:
     listen_handle: vpe.BufListener
     in_progress_parse_operation: InProgressParseOperation
     vim_event_handler: Final = VimEventHandler()
+    change_info: list[int]
+    track_buf: list[str]
+    ch_indices: list[None | int]
 
     def __init__(self, buf: vpe.Buffer, parser: Parser):
         self.buf = buf
         self.reload_count = 0
         self.parser: Parser = parser
-        self.track_buf = list(self.buf)
-        self.change_info = [-1, -1, len(self.track_buf)]
-        self.ch_indices: list[None | int] = []
         self.tree_change_callbacks: list[ParseCompleteCallback] = []
+        self._reset_tracking()
         self.in_progress_parse_operation = InProgressParseOperation(
             proxy(self), self.parser, self.handle_parse_complete)
 
@@ -502,6 +503,8 @@ class Listener:
         unbuffered = not WORKAROUND_TESTING
         self.listen_handle = buf.add_listener(
             self.handle_changes, ops=False, unbuffered=unbuffered)
+        self.ignore_report: bool = False
+        self.simulate_failure: bool = False
         self.buffered_changes: list = []
         self.in_progress_parse_operation.start()
         self.vim_event_handler.add_callback(
@@ -534,44 +537,28 @@ class Listener:
         ) -> None:
         """Process changes for the associated buffer.
 
-        This is invoked by Vim to report changes to the buffer. The start
-        and end line indices are converted into `SyntaxTreeEdit` operations.
-
-        Each detailed raw change provides lnum, end, col and added. The Vim
-        docs are not very clear to me so here are my observations:
-        The lnum and end define an exclusive 1-based range, for example
-        lnum=4, end=6 means lines 4 and 5 but not 6. The added value is
-        posistive when lines are added a negative when lines are removed. In
-        the following description I use the form a->b[+-]added. Examples:
-        4->6+2 means lnum=4, end=6 and added=2.
-
-        Here are a bunch of examples::
-
-            Delete line 3:                   3->4-1
-            Sel del lines 3->6:              3->7-4
-            Add line after 3:                4->4+1
-            Split line 3:                    3->4+1
-            Put line after 3:                4->4+1
-            Put line before 3:               3->3+1
-            Do '3dd' on line 3:              3->6-3
-            Sel within line 'v' 3->4, del:   3->4+0    col=5
-                                             4->5+0    col=1
-                                             3->4+0    col=5
-                                             4->5-1    col=1
-            Undo previous:                   2->5+1
-            Insert in line 3:                3->4+0
+        This is invoked by Vim to report changes to the buffer.
 
         :_buf:        The affected buffer, ignored because the buffer is known.
         :start_lidx:  Start of affected line range.
         :end_lidx:    End of affected line range.
         :added:       The number of lines added or, if negative, deleted.
         """
+        if self.ignore_report:
+            return  # Only set when recovering from a buffer sync error.
+
+        if debug_settings.log_buffer_changes:
+            s = []
+            s.append(f'Vim reports change for buffer {self.buf.number}:')
+            s.append(f'   Lines (vim):   {start_lidx+1}=>{end_lidx+1} {added}')
+            s.append(f'   Track buf old len: {len(self.track_buf)}')
+            log('\n'.join(s))
 
         # Apply the changes to the shadow buffer.
         a, b, n = start_lidx, end_lidx, added
         if self.change_info[0] < 0:
             self.change_info[:2] = [a, b]
-            self.ch_indices = list(range(len(self.track_buf)))
+            self.ch_indices = list(range(len(self.track_buf) + 1))
 
         if n == 0:
             start = self.ch_indices[a]
@@ -584,14 +571,18 @@ class Listener:
             self.ch_indices[b:b] = [None] * n
         else:
             start = self.ch_indices[a]
-            end = self.ch_indices[b - n]
-            self.track_buf[a:b - n] = self.buf[a:b]
-            del self.ch_indices[b:b - n]
-
+            end = self.ch_indices[b]
+            self.track_buf[a:b] = self.buf[a:b + n]
+            del self.ch_indices[a - n:b]
         if start is not None:
             self.change_info[0] = min(self.change_info[0], start)
         if end is not None:
             self.change_info[1] = max(self.change_info[1], end)
+
+        if debug_settings.log_buffer_changes:
+            s = []
+            s.append(f'   Track buf new len: {len(self.track_buf)}')
+            log('\n'.join(s))
 
     def _do_apply_changes(
             self, start_lidx: int, end_lidx: int, added: int) -> None:
@@ -655,13 +646,16 @@ class Listener:
 
         added = len(self.track_buf) - old_len
         failed = False
+        if self.simulate_failure:
+            self.track_buf.append('')
+            self.simulate_failure= False
         if len(self.buf) != len(self.track_buf):
-            print(f'TRACK FAIL: {len(self.buf)=} {len(self.track_buf)=}')
+            log(f'TRACK FAIL: {len(self.buf)=} {len(self.track_buf)=}')
             failed = True
         else:
             for i, (a, b) in enumerate(zip(self.buf, self.track_buf)):
                 if a != b:
-                    print(
+                    log(
                         f'TRACK FAIL: line={i}'
                         f'\n    buf    ={a!r}'
                         f'\n    tracked={b!r}')
@@ -669,16 +663,29 @@ class Listener:
                     break
 
         if failed:
+            # The assumption here is that this is due to report buffering
+            # issues in an older version of Vim. Careful steps are required to
+            # try to avoid the (single) buffered report from interfering with
+            # our recovery efforts.
+            self.ignore_report = True
+            vim.listener_flush(self.buf.number)
+            self.listen_handle.stop_listening()
+            self.ignore_report = False
+            unbuffered = not WORKAROUND_TESTING
+            self.listen_handle = self.buf.add_listener(
+                self.handle_changes, ops=False, unbuffered=unbuffered)
+
+            self._reset_tracking()
             self.in_progress_parse_operation.start_clean()
-            self.track_buf = list(self.buf)
         else:
             self._do_apply_changes(start_lidx, end_lidx, added)
-        self.change_info = [-1, -1, len(self.track_buf)]
+            self.change_info = [-1, -1, len(self.track_buf)]
 
     def handle_buffer_reload(self) -> None:
         """React to this buffer's contents being reloaded."""
         if debug_settings.active:
             log('Start clean parse due to buffer load')
+        self._reset_tracking()
         self.in_progress_parse_operation.start_clean()
 
     def add_parse_complete_callback(
@@ -694,6 +701,11 @@ class Listener:
     def print_tree(self, tree_line_start: int, tree_line_end: int):
         """Print part of the syntax tree for this buffer."""
         self.in_progress_parse_operation.dump(tree_line_start, tree_line_end)
+
+    def _reset_tracking(self):
+        self.track_buf = list(self.buf)
+        self.change_info = [-1, -1, len(self.track_buf)]
+        self.ch_indices = []
 
 
 def merge_ranges(ranges_a: list[range], ranges_b: list[range]) -> list[range]:

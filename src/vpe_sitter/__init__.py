@@ -147,6 +147,7 @@ class DebugSubcommand(SubcommandHandlerBase):
         'status': (':simple', 'Display current debug settings.'),
         'thisline': (':simple', 'Log partial tree for this line.'),
         'tree': (TreeCommand, 'Control tree dumping.'),
+        'fail': (':simple', 'Simulate change tracking failure - do not use!'),
     }
 
     def handle_thisline(self, _args: Namespace) -> None:
@@ -170,6 +171,15 @@ class DebugSubcommand(SubcommandHandlerBase):
         s.append(f'    Tree dump line range: {debug.tree_line_start}'
                  f' --> {debug.tree_line_end}')
         log('\n'.join(s))
+
+    def handle_fail(self, _args: Namespace) -> None:
+        """Simulate a failue of change tracking for the current buffer."""
+        buf = vim.current.buffer
+        if store := buf.retrieve_store('tree-sitter'):
+            print("Doing it!")
+            store.listener.simulate_failure = True
+        else:
+            print("Wrong buffer")
 
 
 class PauseCommand(CommandHandler):
