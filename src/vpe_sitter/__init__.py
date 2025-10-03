@@ -133,6 +133,48 @@ class DebugAllCommand(CommandHandler):
         listen.debug_settings.set_all(args.flag == 'on')
 
 
+class LogTreeSubcommand(CommandHandler):
+    """The 'log tree' subcommand support."""
+
+    def add_arguments(self) -> None:
+        """Add the arguments for this command."""
+        self.parser.add_argument(
+            '--all', action='store_true',
+            help='Log the entire parse tree.')
+        self.parser.add_argument(
+            '--start', type=int, default=0,
+            help='First line to include in the parse tree output.')
+        self.parser.add_argument(
+            '--end', type=int, default=0,
+            help='Last line to include in the parse tree output.')
+
+    def handle_command(self, args: Namespace) -> None:
+        """Handle the log tree subcommand."""
+        buf = vim.current.buffer
+        if not (store := buf.retrieve_store('tree-sitter')):
+            echo_msg('Tree-sitter is not enabled for this buffer')
+            return
+
+        vim.command('Vpe log show')
+        if args.all:
+            store.listener.print_tree(-2, -1)
+        elif args.start > 0 and args.end >= args.start:
+            store.listener.print_tree(args.start, args.end)
+        elif args.start > 0:
+            store.listener.print_tree(args.start, args.start)
+        else:
+            row, _ = vim.current.window.cursor
+            store.listener.print_tree(row, row)
+
+
+class LogSubcommand(SubcommandHandlerBase):
+    """The 'log' sub-command support."""
+
+    subcommands = {
+        'tree': (LogTreeSubcommand, 'Log tree information.'),
+    }
+
+
 class DebugSubcommand(SubcommandHandlerBase):
     """The 'debug' sub-command support."""
 
@@ -145,20 +187,9 @@ class DebugSubcommand(SubcommandHandlerBase):
         'performance': (
             PerformanceCommand, 'Turn performance logging on/off.'),
         'status': (':simple', 'Display current debug settings.'),
-        'thisline': (':simple', 'Log partial tree for this line.'),
         'tree': (TreeCommand, 'Control tree dumping.'),
         'fail': (':simple', 'Simulate change tracking failure - do not use!'),
     }
-
-    def handle_thisline(self, _args: Namespace) -> None:
-        """Print partial tree showing the current line."""
-        buf = vim.current.buffer
-        if store := buf.retrieve_store('tree-sitter'):
-            vim.command('Vpe log show')
-            row, _ = vim.current.window.cursor
-            store.listener.print_tree(row, row)
-        else:
-            echo_msg('Tree-sitter is not enabled for this buffer')
 
     def handle_status(self, _args: Namespace) -> None:
         """Print the current debug settings."""
@@ -219,6 +250,7 @@ class Plugin(TopLevelSubcommandHandler):
         'on': (':simple', 'Turn on tree sitting for the current buffer.'),
         'debug': (DebugSubcommand, 'Control debugging logging.'),
         'pause': (PauseCommand, 'Pause automatic parsing (for debug use).'),
+        'log': (LogSubcommand, 'Write information to the VPE log.'),
         # This command provides very detailed logging about Vim reported
         # changes and stores buffer contents in a Git repository for *every
         # single* change reported by Vim. It will create and also **delete**

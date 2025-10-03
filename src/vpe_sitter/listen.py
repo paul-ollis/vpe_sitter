@@ -412,7 +412,11 @@ class InProgressParseOperation:
         if self.tree is None:
             return
 
-        if tree_line_start >= 1:
+        if tree_line_start < -1:
+            # Whole tree wanted.
+            start_lidx = 0
+            end_lidx = len(self.listener.buf)
+        elif tree_line_start >= 1:
             start_lidx = tree_line_start - 1
             end_lidx = tree_line_end
         else:
