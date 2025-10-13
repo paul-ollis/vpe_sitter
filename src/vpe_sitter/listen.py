@@ -559,8 +559,10 @@ class Listener:
 
         if debug_settings.log_buffer_changes:
             s = []
+            a = start_lidx + 1
+            b = end_lidx + 1
             s.append(f'Vim reports change for buffer {self.buf.number}:')
-            s.append(f'   Lines (vim):   {start_lidx+1}=>{end_lidx+1} {added}')
+            s.append(f'   Lines (1-based):   {a}=>{b} {added}')
             s.append(f'   Track buf old len: {len(self.track_buf)}')
             log('\n'.join(s))
 
@@ -597,6 +599,7 @@ class Listener:
     def _do_apply_changes(
             self, start_lidx: int, end_lidx: int, added: int) -> None:
         """Tell the `InProgressParseOperation` about recent tracked changes."""
+        # pylint: disable=too-many-locals
 
         # Special handling is required if Vim reports added lines starting
         # past the end of the buffer. This happens when, for example, when
@@ -605,7 +608,7 @@ class Listener:
             start_lidx = max(0, len(self.byte_offsets) - 2)
 
         # TODO: Why is the next line required?
-        end_lidx = min(end_lidx, len(self.byte_offsets))
+        end_lidx = min(end_lidx, len(self.byte_offsets) - 1)
 
         # The start offset and old end byte offset depend on the previously
         # calculated line byte offsets.
@@ -620,6 +623,28 @@ class Listener:
              for line in self.track_buf[start_lidx:]],
             initial=start_offset)
         )
+
+        # TODO: This is bug detection code.
+        byte_offsets = list(accumulate([
+            len(line.encode('utf-8')) + 1
+            for line in self.buf], initial=0))
+        failed = False
+        if len(byte_offsets) != len(self.byte_offsets):
+            log(
+                f'OFFSETS FAIL: {len(byte_offsets)=}'
+                f' {len(self.byte_offsets)=}')
+            failed = True
+        else:
+            for i, (a, b) in enumerate(zip(byte_offsets, self.byte_offsets)):
+                if a != b:
+                    log(
+                        f'OFFSET FAIL: line={i}'
+                        f'\n    buf    ={a!r}'
+                        f'\n    tracked={b!r}')
+                    failed = True
+                    break
+        if failed:
+            self.byte_offsets = byte_offsets
 
         # The new end byte offset uses the newly calculated line byte
         # offsets.
@@ -641,9 +666,11 @@ class Listener:
         )
         if debug_settings.log_buffer_changes:
             s = []
+            a = start_lidx + 1
+            b = end_lidx + 1
             s.append('Handle change:')
-            s.append(f'   Line (range): {start_lidx+1}=>{end_lidx+1} {added}')
-            s.append(f'   Edit:         {edit.format_1()}')
+            s.append(f'   Line (1-based): {a}=>{b} {added}')
+            s.append(f'   Edit:           {edit.format_1()}')
             log('\n'.join(s))
 
         self.in_progress_parse_operation.add_edit(edit)
@@ -719,6 +746,9 @@ class Listener:
 
     def _reset_tracking(self):
         self.track_buf = list(self.buf)
+        self.byte_offsets = list(accumulate([
+            len(line.encode('utf-8')) + 1
+            for line in self.track_buf], initial=0))
         self.change_info = [-1, -1, len(self.track_buf)]
         self.ch_indices = []
 
