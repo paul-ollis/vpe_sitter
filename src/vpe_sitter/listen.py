@@ -82,6 +82,7 @@ class ConditionCode(Enum):
     NEW_CLEAN_TREE = 1
     NEW_OUT_OF_DATE_TREE = 2
     PENDING_CHANGES = 3
+    RELOAD = 4
 
 
 class ActionTimer:
@@ -407,7 +408,9 @@ class InProgressParseOperation:
         """Continue parsing if suspended due to a timeout."""
         self._try_parse()
 
-    def dump(self, tree_line_start: int = -1, tree_line_end: int = -1):
+    def dump(
+            self, tree_line_start: int = -1, tree_line_end: int = -1,
+            show_ranges: bool = False):
         """Dump a representaion of part of the tree."""
         if self.tree is None:
             return
@@ -449,9 +452,12 @@ class InProgressParseOperation:
 
                 if field_name:
                     name = f'{field_name}:{name}'
-                s.append(f'{pad[-1]}{name} {a}->{b}')
+                if show_ranges:
+                    s.append(f'{pad[-1]}{name} {a}->{b}')
+                else:
+                    s.append(f'{pad[-1]}{name}')
 
-                pad.append(pad[-1] + '  ')
+                pad.append(pad[-1] + '    ')
                 for i, child in enumerate(node.children):
                     field_name = node.field_name_for_child(i)
                     put_node(child, field_name)
@@ -691,6 +697,8 @@ class Listener:
             log('Start clean parse due to buffer load')
         self._reset_tracking()
         self.in_progress_parse_operation.start_clean()
+        self.in_progress_parse_operation.parse_done_callback(
+            ConditionCode.RELOAD, [])
 
     def add_parse_complete_callback(
             self, callback: ParseCompleteCallback,
@@ -702,9 +710,12 @@ class Listener:
         if tree is not None and not active:
             callback(ConditionCode.NEW_OUT_OF_DATE_TREE, [])
 
-    def print_tree(self, tree_line_start: int, tree_line_end: int):
+    def print_tree(
+            self, tree_line_start: int, tree_line_end: int,
+            show_ranges: bool = False):
         """Print part of the syntax tree for this buffer."""
-        self.in_progress_parse_operation.dump(tree_line_start, tree_line_end)
+        self.in_progress_parse_operation.dump(
+            tree_line_start, tree_line_end, show_ranges=show_ranges)
 
     def _reset_tracking(self):
         self.track_buf = list(self.buf)

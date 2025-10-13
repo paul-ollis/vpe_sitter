@@ -5,7 +5,10 @@ has a supported language.
 """
 from __future__ import annotations
 
+import platform
+import sys
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import vpe
@@ -147,6 +150,9 @@ class LogTreeSubcommand(CommandHandler):
         self.parser.add_argument(
             '--end', type=int, default=0,
             help='Last line to include in the parse tree output.')
+        self.parser.add_argument(
+            '--ranges', action='store_true',
+            help='Include line/column ranges for each node.')
 
     def handle_command(self, args: Namespace) -> None:
         """Handle the log tree subcommand."""
@@ -157,14 +163,16 @@ class LogTreeSubcommand(CommandHandler):
 
         vim.command('Vpe log show')
         if args.all:
-            store.listener.print_tree(-2, -1)
+            store.listener.print_tree(-2, -1, ranges=args.show_ranges)
         elif args.start > 0 and args.end >= args.start:
-            store.listener.print_tree(args.start, args.end)
+            store.listener.print_tree(
+                args.start, args.end, show_ranges=args.ranges)
         elif args.start > 0:
-            store.listener.print_tree(args.start, args.start)
+            store.listener.print_tree(
+                args.start, args.start, show_ranges=args.ranges)
         else:
             row, _ = vim.current.window.cursor
-            store.listener.print_tree(row, row)
+            store.listener.print_tree(row, row, show_ranges=args.ranges)
 
 
 class LogSubcommand(SubcommandHandlerBase):
@@ -176,7 +184,7 @@ class LogSubcommand(SubcommandHandlerBase):
 
 
 class DebugSubcommand(SubcommandHandlerBase):
-    """The 'debug' sub-command support."""
+    """The 'debug' subcommand support."""
 
     subcommands = {
         'all': (
@@ -213,6 +221,67 @@ class DebugSubcommand(SubcommandHandlerBase):
             print("Wrong buffer")
 
 
+class InstallHintCommand(CommandHandler):
+    """The 'hint install' subcommand support."""
+
+    def add_arguments(self) -> None:
+        """Add the arguments for this command."""
+        self.parser.add_argument(
+            'package',
+            help='The name of your python package.')
+
+    def handle_command(self, args: Namespace):
+        """Handle the 'Tree hint install' command."""
+        vimdir: Path = Path(vpe.dot_vim_dir())
+        venvdir = vimdir / 'lib' / 'python'
+        py_prog = venvdir / 'bin' / 'python'
+        cmd = ''
+        if py_prog.exists():
+            cmd = f'{py_prog} -m pip install --upgrade {args.package}'
+        else:
+            if platform.system() == 'Windows':
+                # I do not know why, but on Windows sys.executable is the GVIM
+                # program! So we build the name using sys.exec_prefix.
+                dirpath = Path(sys.exec_prefix)
+                py_prog = dirpath / 'python.exe'
+            else:
+                py_prog = sys.executable
+            if py_prog.exists():
+                cmd = f'{py_prog} -m pip install --user --upgrade'
+                cmd += f' {args.package}'
+        if cmd:
+            echo_msg('Suggested install command is:')
+            echo_msg(f'    {cmd}')
+        else:
+            echo_msg('Could not determine the Python executable!')
+
+
+class HintSubcommand(SubcommandHandlerBase):
+    """The 'hint' subcommand support."""
+
+    subcommands = {
+        'install': (InstallHintCommand, 'Hinting for installation.'),
+    }
+
+
+class InfoSubcommand(SubcommandHandlerBase):
+    """The 'info' subcommand support."""
+
+    subcommands = {
+        'languages': (':simple', 'List supported languages.'),
+    }
+
+    def add_arguments(self) -> None:
+        """Add the arguments for this command."""
+        self.parser.add_argument(
+            '--log', action='store_true',
+            help='Write output to the VPE log.')
+
+    def handle_languages(self, args: Namespace) -> None:
+        """Handle the 'Treesit info languages command."""
+        parsers.list_supported_languages(args.log)
+
+
 class PauseCommand(CommandHandler):
     """The 'pause' sub-command support."""
 
@@ -229,40 +298,27 @@ class PauseCommand(CommandHandler):
             store.listener.pause(args.flag == 'on')
 
 
-class TrackCommand(CommandHandler):
-    """The 'track' sub-command support."""
-
-    def add_arguments(self) -> None:
-        """Add the arguments for this command."""
-        self.parser.add_argument(
-            'flag', choices=['on', 'off'],
-            help='Enable or disable detail change track logging.')
-
-    def handle_command(self, args: Namespace):
-        """Handle the 'Treesit track' command."""
-        listen.Listener.track(args.flag == 'on')
-
-
 class Plugin(TopLevelSubcommandHandler):
     """The plug-in, which provides the commands."""
 
     subcommands = {
         'on': (':simple', 'Turn on tree sitting for the current buffer.'),
+        'openconfig': (':simple', 'Open the user configuration file.'),
         'debug': (DebugSubcommand, 'Control debugging logging.'),
         'pause': (PauseCommand, 'Pause automatic parsing (for debug use).'),
         'log': (LogSubcommand, 'Write information to the VPE log.'),
-        # This command provides very detailed logging about Vim reported
-        # changes and stores buffer contents in a Git repository for *every
-        # single* change reported by Vim. It will create and also **delete**
-        # the directory $HOME/tmp/ts_log, using shutil.rmtree. So enable and
-        # use this at your own risk.
-        #-'track':
-        #-    (TrackCommand, 'For debug only: control change tracking.'),
+        'hint': (
+            HintSubcommand, 'Provide hints for things like installation.'),
+        'info': (InfoSubcommand, 'Display useful information.'),
     }
 
     def handle_on(self, _args: Namespace) -> None:
         """Handle the 'Treesit on' command."""
         treesit_current_buffer()
+
+    def handle_openconfig(self, _args: Namespace) -> None:
+        """Handle the 'Treesit openconfig' command."""
+        parsers.open_config()
 
 
 app = Plugin('Treesit')

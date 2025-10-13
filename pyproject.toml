@@ -1,6 +1,6 @@
 [project]
 name = "vpe-sitter"
-version = "0.1.2"
+version = "0.2.0"
 authors = [
   { name="Paul Ollis", email="paul@cleversheep.org" },
 ]
@@ -18,7 +18,7 @@ classifiers = [
     "Topic :: Education",
 ]
 dependencies = [
-    'vpe>=0.7.1',
+    'vpe>=0.7.3',
     'tree-sitter==0.24.0',
 ]
 
