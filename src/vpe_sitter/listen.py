@@ -83,6 +83,7 @@ class ConditionCode(Enum):
     NEW_OUT_OF_DATE_TREE = 2
     PENDING_CHANGES = 3
     RELOAD = 4
+    DELETE = 5
 
 
 class ActionTimer:
@@ -199,6 +200,18 @@ class VimEventHandler(EventHandler):
             listener = store.listener
             if listener is not None:
                 listener.handle_buffer_reload()
+
+    @EventHandler.handle('BufDelete')
+    def handle_buffer_delete(self) -> None:
+        """React to a buffer's deletion."""
+        buf_number = int(vim.expand('<abuf>'))
+        buf = vim.buffers[buf_number]
+        store = buf.retrieve_store('tree-sitter')
+        if store is not None:
+            listener = store.listener
+            if listener is not None:
+                listener.handle_buffer_deletion()
+                del store.listener
 
     @EventHandler.handle('SafeState')
     def handle_safe_state(self) -> None:
@@ -726,6 +739,14 @@ class Listener:
         self.in_progress_parse_operation.start_clean()
         self.in_progress_parse_operation.parse_done_callback(
             ConditionCode.RELOAD, [])
+
+    def handle_buffer_deletion(self) -> None:
+        """React to this buffer's deletion."""
+        if debug_settings.active:
+            log(f'Listener for Buffer {self.buf.number} closing'
+                ' - buffer deletion.')
+        self.in_progress_parse_operation.parse_done_callback(
+            ConditionCode.DELETE, [])
 
     def add_parse_complete_callback(
             self, callback: ParseCompleteCallback,

@@ -50,7 +50,7 @@ def treesit_current_buffer() -> str:
         return f'No Tree-sitter parser available for {filetype}.'
 
     store = buf.retrieve_store('tree-sitter')
-    if store is None:
+    if store is None or store.listener is None:
         log(f'VPE-sitter: Can parse {filetype}')
         log(f'VPE-sitter:    {parser=}')
         log(f'VPE-sitter:    {parser.language=}')
@@ -163,7 +163,7 @@ class LogTreeSubcommand(CommandHandler):
 
         vim.command('Vpe log show')
         if args.all:
-            store.listener.print_tree(-2, -1, ranges=args.show_ranges)
+            store.listener.print_tree(-2, -1, show_ranges=args.ranges)
         elif args.start > 0 and args.end >= args.start:
             store.listener.print_tree(
                 args.start, args.end, show_ranges=args.ranges)

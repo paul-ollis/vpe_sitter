@@ -2,6 +2,12 @@
 Change Log
 ==========
 
+Version 0.2.1
+-------------
+
+- Part of fix for https://github.com/paul-ollis/vpe_syntax/issues/7.
+
+
 Version 0.2.0
 -------------
 
